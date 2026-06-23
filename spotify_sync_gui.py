@@ -391,8 +391,8 @@ class Downloader:
         self.output_dir = output_dir
         self.config = config
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._proc = None
-        self._lock = threading.Lock()
+        self._proc: Optional[subprocess.Popen] = None
+        self._cancelled = threading.Event()
 
     def _force_kill(self, pid: int):
         """Mata el proceso y todos sus hijos de forma cross-platform."""
@@ -418,12 +418,10 @@ class Downloader:
 
     def cancel(self):
         """Fuerza la terminacion del proceso yt-dlp actual (y subprocesos)."""
-        with self._lock:
-            proc = self._proc
-            if proc is None:
-                return
-            pid = proc.pid
-        self._force_kill(pid)
+        self._cancelled.set()
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            self._force_kill(proc.pid)
 
     def find_existing(self, track: Track) -> Optional[Path]:
         safe = track.safe_filename
@@ -439,13 +437,12 @@ class Downloader:
                 return candidate
         return None
 
-    def download(self, track: Track, should_cancel: Optional[Callable[[], bool]] = None) -> Optional[Path]:
+    def download(self, track: Track) -> Optional[Path]:
         existing = self.find_existing(track)
         if existing and self.config.SKIP_EXISTING:
             return existing
 
-        if should_cancel and should_cancel():
-            return None
+        self._cancelled.clear()
 
         output_template = str(self.output_dir / f"{track.safe_filename}.%(ext)s")
 
@@ -475,32 +472,22 @@ class Downloader:
             else:
                 kwargs["preexec_fn"] = os.setsid
 
-            with self._lock:
-                if should_cancel and should_cancel():
-                    return None
-                self._proc = subprocess.Popen(cmd, **kwargs)
-                pid = self._proc.pid
+            self._proc = subprocess.Popen(cmd, **kwargs)
+            pid = self._proc.pid
 
             return_code = None
             try:
-                while True:
-                    with self._lock:
-                        if self._proc is None:
-                            break
-                        ret = self._proc.poll()
-                    if ret is not None:
-                        return_code = ret
-                        break
-                    if should_cancel and should_cancel():
+                while self._proc.poll() is None:
+                    if self._cancelled.is_set():
                         self._force_kill(pid)
                         return None
                     time.sleep(0.2)
+                return_code = self._proc.returncode
             finally:
-                with self._lock:
-                    self._proc = None
+                self._proc = None
 
             if return_code != 0:
-                return self._retry(track, should_cancel)
+                return self._retry(track)
             downloaded = self.find_existing(track)
             if downloaded:
                 return downloaded
@@ -508,13 +495,13 @@ class Downloader:
         except Exception:
             return None
 
-    def _retry(self, track: Track, should_cancel: Optional[Callable[[], bool]] = None) -> Optional[Path]:
+    def _retry(self, track: Track) -> Optional[Path]:
         queries = [
             f"{track.legacy_display_name}",
             f"{track.name} {track.artists[0] if track.artists else ''} audio",
         ]
         for q in queries:
-            if should_cancel and should_cancel():
+            if self._cancelled.is_set():
                 return None
 
             output_template = str(self.output_dir / f"{track.safe_filename}.%(ext)s")
@@ -535,29 +522,19 @@ class Downloader:
                 else:
                     kwargs["preexec_fn"] = os.setsid
 
-                with self._lock:
-                    if should_cancel and should_cancel():
-                        return None
-                    self._proc = subprocess.Popen(cmd, **kwargs)
-                    pid = self._proc.pid
+                self._proc = subprocess.Popen(cmd, **kwargs)
+                pid = self._proc.pid
 
                 return_code = None
                 try:
-                    while True:
-                        with self._lock:
-                            if self._proc is None:
-                                break
-                            ret = self._proc.poll()
-                        if ret is not None:
-                            return_code = ret
-                            break
-                        if should_cancel and should_cancel():
+                    while self._proc.poll() is None:
+                        if self._cancelled.is_set():
                             self._force_kill(pid)
                             return None
                         time.sleep(0.2)
+                    return_code = self._proc.returncode
                 finally:
-                    with self._lock:
-                        self._proc = None
+                    self._proc = None
 
                 if return_code == 0:
                     existing = self.find_existing(track)
@@ -565,7 +542,7 @@ class Downloader:
                         return existing
             except Exception:
                 pass
-            if should_cancel and should_cancel():
+            if self._cancelled.is_set():
                 return None
             time.sleep(1)
         return None
@@ -697,10 +674,7 @@ class SyncEngine:
                 if self.progress_cb:
                     self.progress_cb(i + 1, total_to_download, track.display_name)
 
-                result = downloader.download(
-                    track,
-                    should_cancel=lambda: stop_event.is_set() if stop_event else False
-                )
+                result = downloader.download(track)
                 if result:
                     files_map[track.id] = str(result.name)
                     downloaded += 1
