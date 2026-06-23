@@ -1,5 +1,23 @@
+# Dependencias de Python (instalar con: pip install -r requirements.txt)
+# Nota: yt-dlp requiere FFmpeg instalado en el sistema (ver README.md)
+
 requests>=2.31.0
 spotifyscraper>=2.1.0
 yt-dlp>=2024.1.0
 pystray>=0.19.5
 Pillow>=10.0.0
+
+# --- Dependencias del sistema (NO se instalan con pip) ---
+#
+# Windows:
+#   - Tkinter: incluido con el instalador oficial de python.org
+#   - FFmpeg: descargar desde https://www.gyan.dev/ffmpeg/builds/ y agregar al PATH
+#
+# Linux (Debian/Ubuntu/Mint):
+#   sudo apt install python3-tk python3-pip libappindicator3-1 ffmpeg
+#
+# Linux (Arch/Manjaro):
+#   sudo pacman -S python tk libappindicator-gtk3 ffmpeg
+#
+# Linux (Fedora):
+#   sudo dnf install python3-tkinter libappindicator-gtk3 ffmpeg
