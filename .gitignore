@@ -1,0 +1,29 @@
+# Bytecode / cache de Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Entornos virtuales
+venv/
+env/
+.venv/
+
+# Datos generados por la app (config personal y estado de sincronizacion)
+spotify_sync_config.json
+.spotify_sync_state/
+
+# Audio descargado (por si alguna playlist queda guardada dentro del repo)
+*.mp3
+*.m4a
+*.flac
+*.opus
+*.ogg
+*.wav
+
+# Sistema
+Thumbs.db
+.DS_Store
+
+# Editores
+.vscode/
+.idea/ 
