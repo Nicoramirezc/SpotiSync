@@ -16,6 +16,7 @@ import gc
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -25,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 
 import importlib.util
 
@@ -147,8 +148,6 @@ def set_startup_enabled(enable: bool) -> bool:
         try:
             if enable:
                 script_path = Path(__file__).resolve()
-                # Usamos python3 directamente; si se quiere minimizado, se pasa --minimized
-                # y la app ya soporta ese flag.
                 entry = f"""[Desktop Entry]
 Type=Application
 Name=Spotify Sync
@@ -229,12 +228,10 @@ class Track:
 
     @property
     def display_name(self) -> str:
-        """Nuevo formato: Cancion - Artista"""
         return f"{self.name} - {', '.join(self.artists)}"
 
     @property
     def legacy_display_name(self) -> str:
-        """Formato antiguo para buscar archivos existentes"""
         return f"{', '.join(self.artists)} - {self.name}"
 
     @property
@@ -251,7 +248,6 @@ class Track:
 
     @property
     def search_query(self) -> str:
-        # Para YouTube, Artista - Cancion sigue funcionando mejor
         return f"{self.legacy_display_name} official audio"
 
 
@@ -395,16 +391,47 @@ class Downloader:
         self.output_dir = output_dir
         self.config = config
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._proc = None
+        self._lock = threading.Lock()
+
+    def _force_kill(self, pid: int):
+        """Mata el proceso y todos sus hijos de forma cross-platform."""
+        if IS_WINDOWS:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW,
+                    check=False,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
+    def cancel(self):
+        """Fuerza la terminacion del proceso yt-dlp actual (y subprocesos)."""
+        with self._lock:
+            proc = self._proc
+            if proc is None:
+                return
+            pid = proc.pid
+        self._force_kill(pid)
 
     def find_existing(self, track: Track) -> Optional[Path]:
-        # Buscar formato nuevo primero (Cancion - Artista)
         safe = track.safe_filename
         for ext in [".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav"]:
             candidate = self.output_dir / f"{safe}{ext}"
             if candidate.exists():
                 return candidate
 
-        # Buscar formato antiguo (Artista - Cancion) para no re-descargar
         legacy = track.legacy_safe_filename
         for ext in [".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav"]:
             candidate = self.output_dir / f"{legacy}{ext}"
@@ -412,10 +439,13 @@ class Downloader:
                 return candidate
         return None
 
-    def download(self, track: Track) -> Optional[Path]:
+    def download(self, track: Track, should_cancel: Optional[Callable[[], bool]] = None) -> Optional[Path]:
         existing = self.find_existing(track)
         if existing and self.config.SKIP_EXISTING:
             return existing
+
+        if should_cancel and should_cancel():
+            return None
 
         output_template = str(self.output_dir / f"{track.safe_filename}.%(ext)s")
 
@@ -436,19 +466,41 @@ class Downloader:
             cmd.extend(self.config.YTDLP_EXTRA.split())
 
         try:
-            # No capturamos stdout/stderr (no se usan): evita acumular en RAM
-            # toda la salida de texto de yt-dlp durante la descarga.
             kwargs = {
                 "stdout": subprocess.DEVNULL,
                 "stderr": subprocess.DEVNULL,
-                "timeout": 300,
             }
             if IS_WINDOWS:
                 kwargs["creationflags"] = CREATE_NO_WINDOW
+            else:
+                kwargs["preexec_fn"] = os.setsid
 
-            result = subprocess.run(cmd, **kwargs)
-            if result.returncode != 0:
-                return self._retry(track)
+            with self._lock:
+                if should_cancel and should_cancel():
+                    return None
+                self._proc = subprocess.Popen(cmd, **kwargs)
+                pid = self._proc.pid
+
+            return_code = None
+            try:
+                while True:
+                    with self._lock:
+                        if self._proc is None:
+                            break
+                        ret = self._proc.poll()
+                    if ret is not None:
+                        return_code = ret
+                        break
+                    if should_cancel and should_cancel():
+                        self._force_kill(pid)
+                        return None
+                    time.sleep(0.2)
+            finally:
+                with self._lock:
+                    self._proc = None
+
+            if return_code != 0:
+                return self._retry(track, should_cancel)
             downloaded = self.find_existing(track)
             if downloaded:
                 return downloaded
@@ -456,12 +508,15 @@ class Downloader:
         except Exception:
             return None
 
-    def _retry(self, track: Track) -> Optional[Path]:
+    def _retry(self, track: Track, should_cancel: Optional[Callable[[], bool]] = None) -> Optional[Path]:
         queries = [
             f"{track.legacy_display_name}",
             f"{track.name} {track.artists[0] if track.artists else ''} audio",
         ]
         for q in queries:
+            if should_cancel and should_cancel():
+                return None
+
             output_template = str(self.output_dir / f"{track.safe_filename}.%(ext)s")
             cmd = [
                 "yt-dlp", "-x", "--audio-format", self.config.OUTPUT_FORMAT,
@@ -474,24 +529,50 @@ class Downloader:
                 kwargs = {
                     "stdout": subprocess.DEVNULL,
                     "stderr": subprocess.DEVNULL,
-                    "timeout": 300,
                 }
                 if IS_WINDOWS:
                     kwargs["creationflags"] = CREATE_NO_WINDOW
+                else:
+                    kwargs["preexec_fn"] = os.setsid
 
-                result = subprocess.run(cmd, **kwargs)
-                if result.returncode == 0:
+                with self._lock:
+                    if should_cancel and should_cancel():
+                        return None
+                    self._proc = subprocess.Popen(cmd, **kwargs)
+                    pid = self._proc.pid
+
+                return_code = None
+                try:
+                    while True:
+                        with self._lock:
+                            if self._proc is None:
+                                break
+                            ret = self._proc.poll()
+                        if ret is not None:
+                            return_code = ret
+                            break
+                        if should_cancel and should_cancel():
+                            self._force_kill(pid)
+                            return None
+                        time.sleep(0.2)
+                finally:
+                    with self._lock:
+                        self._proc = None
+
+                if return_code == 0:
                     existing = self.find_existing(track)
                     if existing:
                         return existing
             except Exception:
                 pass
+            if should_cancel and should_cancel():
+                return None
             time.sleep(1)
         return None
 
 
 class SyncEngine:
-    def __init__(self, config: Config, progress_cb=None, status_cb=None):
+    def __init__(self, config: Config, progress_cb=None, status_cb=None, playlists_source: Optional[Callable[[], List[dict]]] = None):
         self.config = config
         self.spotify = SpotifyExtractor()
         self.state_dir = Path(config.STATE_DIR)
@@ -500,6 +581,10 @@ class SyncEngine:
         self.status_cb = status_cb
         self._daemon_running = False
         self._daemon_thread = None
+        self._playlists_source = playlists_source
+        self._stop_event: Optional[threading.Event] = None
+        self._current_downloader: Optional[Downloader] = None
+        self._downloader_lock = threading.Lock()
 
     def _state_file(self, playlist_id: str) -> Path:
         return self.state_dir / f"{playlist_id}.json"
@@ -531,8 +616,7 @@ class SyncEngine:
                 return False
         return True
 
-    def sync(self, playlist_url: str, output_dir: Path, force: bool = False) -> dict:
-        """Sincroniza una playlist. Siempre compara IDs reales y SIEMPRE guarda el estado."""
+    def sync(self, playlist_url: str, output_dir: Path, force: bool = False, stop_event: Optional[threading.Event] = None) -> dict:
         playlist_id = self.spotify.extract_playlist_id(playlist_url)
         state = self._load_state(playlist_id)
 
@@ -545,21 +629,17 @@ class SyncEngine:
         skipped = len(playlist.tracks) - len(tracks)
         current_ids = {t.id for t in tracks}
 
-        # Cargar estado previo
         prev_ids = set(state.get("track_ids", []))
         prev_files = dict(state.get("files", {}))
 
-        # Comparar IDs
         new_ids = current_ids - prev_ids
         removed_ids = prev_ids - current_ids
 
-        # Verificar archivos fisicos faltantes (tanto en prev_files como en current_ids sin entrada)
         missing_files = []
         for tid, fname in prev_files.items():
             if tid in current_ids and not (output_dir / fname).exists():
                 missing_files.append(tid)
 
-        # Tambien detectar tracks en current_ids que no tienen archivo asociado
         downloader = Downloader(output_dir, self.config)
         for track in tracks:
             if track.id in current_ids and not downloader.find_existing(track):
@@ -572,7 +652,6 @@ class SyncEngine:
             self.status_cb("", f"Playlist: {playlist.name} | Tracks: {len(tracks)} | Nuevas: {len(new_ids)} | Eliminar: {len(removed_ids)} | Faltan: {len(missing_files)}")
 
         if not has_changes:
-            # Aun asi, guardar estado para actualizar last_sync y limpiar referencias rotas
             self._save_state(playlist_id, {
                 "playlist_name": playlist.name,
                 "last_sync": datetime.now().isoformat(),
@@ -582,38 +661,58 @@ class SyncEngine:
             })
             return {"status": "no_changes", "playlist_name": playlist.name, "total_tracks": len(tracks)}
 
-        # Construir mapa de archivos existentes
         files_map = {}
         for track in tracks:
             existing = downloader.find_existing(track)
             if existing:
                 files_map[track.id] = str(existing.name)
 
-        # Tambien incluir archivos previos que aun existen
         for tid, fname in prev_files.items():
             if tid in current_ids and (output_dir / fname).exists():
                 files_map[tid] = fname
 
-        # Determinar que realmente necesita descarga
         tracks_to_download = [t for t in tracks if t.id in new_ids or t.id not in files_map]
         total_to_download = len(tracks_to_download)
 
         downloaded = 0
         failed = 0
 
-        for i, track in enumerate(tracks_to_download):
-            if self.progress_cb:
-                self.progress_cb(i + 1, total_to_download, track.display_name)
+        with self._downloader_lock:
+            self._current_downloader = downloader
+        try:
+            for i, track in enumerate(tracks_to_download):
+                if stop_event and stop_event.is_set():
+                    if self.status_cb:
+                        self.status_cb("", "Cancelado por el usuario")
+                    break
 
-            result = downloader.download(track)
-            if result:
-                files_map[track.id] = str(result.name)
-                downloaded += 1
-            else:
-                failed += 1
-            time.sleep(1.5)
+                if self._playlists_source:
+                    active_playlists = self._playlists_source()
+                    active_ids = {self.spotify.extract_playlist_id(p["url"]) for p in active_playlists}
+                    if playlist_id not in active_ids:
+                        if self.status_cb:
+                            self.status_cb("", "Playlist eliminada, deteniendo sincronizacion")
+                        break
 
-        # Eliminar canciones que ya no estan en Spotify
+                if self.progress_cb:
+                    self.progress_cb(i + 1, total_to_download, track.display_name)
+
+                result = downloader.download(
+                    track,
+                    should_cancel=lambda: stop_event.is_set() if stop_event else False
+                )
+                if result:
+                    files_map[track.id] = str(result.name)
+                    downloaded += 1
+                else:
+                    failed += 1
+
+                if stop_event and stop_event.wait(1.5):
+                    break
+        finally:
+            with self._downloader_lock:
+                self._current_downloader = None
+
         deleted = 0
         if self.config.DELETE_REMOVED:
             for rid in removed_ids:
@@ -628,7 +727,6 @@ class SyncEngine:
                     if rid in files_map:
                         del files_map[rid]
 
-        # SIEMPRE guardar el estado al final, incluso si hubo errores
         self._save_state(playlist_id, {
             "playlist_name": playlist.name,
             "last_sync": datetime.now().isoformat(),
@@ -637,8 +735,6 @@ class SyncEngine:
             "files": {tid: fname for tid, fname in files_map.items() if tid in current_ids}
         })
 
-        # Liberar memoria de las estructuras grandes (lista de tracks, metadatos, etc.)
-        # apenas terminamos, en vez de esperar a que el recolector pase por su cuenta.
         gc.collect()
 
         return {
@@ -654,20 +750,22 @@ class SyncEngine:
 
     def start_daemon(self, playlists: List[dict]):
         self._daemon_running = True
+        self._stop_event = threading.Event()
         self._daemon_thread = threading.Thread(target=self._daemon_loop, args=(playlists,), daemon=True)
         self._daemon_thread.start()
 
     def _daemon_loop(self, playlists: List[dict]):
         while self._daemon_running:
-            for pl in playlists:
-                if not self._daemon_running:
+            current_playlists = self._playlists_source() if self._playlists_source else playlists
+            for pl in current_playlists:
+                if not self._daemon_running or (self._stop_event and self._stop_event.is_set()):
                     break
                 try:
                     if self.status_cb:
                         self.status_cb(pl.get("name", ""), "Verificando cambios...")
                     out = Path(pl["output"])
                     out.mkdir(parents=True, exist_ok=True)
-                    result = self.sync(pl["url"], out)
+                    result = self.sync(pl["url"], out, stop_event=self._stop_event)
                     if self.status_cb:
                         if "error" in result:
                             self.status_cb(pl.get("name", ""), f"Error: {result['error'][:50]}")
@@ -678,18 +776,26 @@ class SyncEngine:
                 except Exception as e:
                     if self.status_cb:
                         self.status_cb(pl.get("name", ""), f"Error: {str(e)[:50]}")
-            if self._daemon_running:
+            if self._daemon_running and (self._stop_event and not self._stop_event.is_set()):
                 if self.status_cb:
                     self.status_cb("", "Esperando...")
-                for _ in range(self.config.SYNC_INTERVAL):
-                    if not self._daemon_running:
+                slept = 0
+                while slept < self.config.SYNC_INTERVAL and self._daemon_running:
+                    if self._stop_event and self._stop_event.wait(1.0):
                         break
-                    time.sleep(1)
+                    slept += 1
 
     def stop_daemon(self):
         self._daemon_running = False
+        if self._stop_event:
+            self._stop_event.set()
+        with self._downloader_lock:
+            dl = self._current_downloader
+        if dl:
+            dl.cancel()
         if self._daemon_thread:
             self._daemon_thread.join(timeout=5)
+        self._stop_event = None
 
     def is_daemon_running(self) -> bool:
         return self._daemon_running
@@ -737,17 +843,12 @@ class SpotifySyncApp:
         self.root.bind("<Unmap>", self._on_unmap)
         self._process_queue()
 
-        # Si la ultima vez el auto-sync estaba activo, se reanuda solo
         if self.settings.get("auto_sync_enabled") and self.playlists:
             self.root.after(400, self.start_autosync)
 
-        # Si se lanzo con --minimized (p.ej. al iniciar el sistema), ocultar a la bandeja
         if start_minimized:
             self.root.after(700, lambda: self.hide_to_tray(silent=True))
 
-    # ------------------------------------------------------------------
-    # Estilo
-    # ------------------------------------------------------------------
     def _setup_style(self):
         style = ttk.Style()
         for theme in ("vista", "clam"):
@@ -762,9 +863,6 @@ class SpotifySyncApp:
         style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=6)
         style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
 
-    # ------------------------------------------------------------------
-    # Dependencias
-    # ------------------------------------------------------------------
     def check_dependencies(self):
         missing = []
         if importlib.util.find_spec("spotify_scraper") is None:
@@ -794,9 +892,6 @@ class SpotifySyncApp:
                 f"Instalalos con:\npip install {' '.join(missing)}{extra_msg}"
             )
 
-    # ------------------------------------------------------------------
-    # Configuracion persistente
-    # ------------------------------------------------------------------
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
             try:
@@ -814,9 +909,6 @@ class SpotifySyncApp:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # Construccion de la interfaz
-    # ------------------------------------------------------------------
     def build_ui(self):
         self.root.configure(bg=COLOR_BG_HEADER)
         main = ttk.Frame(self.root, padding="14")
@@ -929,7 +1021,6 @@ class SpotifySyncApp:
         wrap.columnconfigure(0, weight=3)
         wrap.columnconfigure(1, weight=2)
 
-        # --- Sincronizacion automatica ---
         cf = ttk.LabelFrame(wrap, text="Sincronizacion automatica", padding="10")
         cf.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
@@ -955,7 +1046,6 @@ class SpotifySyncApp:
         self.interval_var.trace_add("write", lambda *a: self._on_settings_changed())
         self.format_var.trace_add("write", lambda *a: self._on_settings_changed())
 
-        # --- Inicio con el sistema ---
         sf = ttk.LabelFrame(wrap, text="Inicio con el sistema", padding="10")
         sf.grid(row=0, column=1, sticky="nsew")
 
@@ -978,9 +1068,6 @@ class SpotifySyncApp:
         bar.grid(row=5, column=0, sticky="ew")
         ttk.Label(bar, textvariable=self.status_var, anchor="w", padding=(6, 4)).pack(side="left", fill="x", expand=True)
 
-    # ------------------------------------------------------------------
-    # Helpers de estado / configuracion en vivo
-    # ------------------------------------------------------------------
     def _on_settings_changed(self):
         try:
             self.settings["interval"] = max(10, int(self.interval_var.get()))
@@ -1003,9 +1090,6 @@ class SpotifySyncApp:
         self.config.DELETE_REMOVED = self.delete_var.get()
 
     def _repair_startup_entry(self):
-        """Si el inicio automatico estaba activado en una sesion anterior,
-        vuelve a registrar la ruta actual. Esto evita que deje de funcionar
-        si la carpeta del programa fue movida o renombrada."""
         if not self.settings.get("start_with_windows"):
             return
         if IS_WINDOWS:
@@ -1041,9 +1125,6 @@ class SpotifySyncApp:
             self.autosync_label.configure(text="Auto-Sync: Detenido")
             self.btn_daemon.configure(text="▶ Iniciar Auto-Sync")
 
-    # ------------------------------------------------------------------
-    # Lista de playlists
-    # ------------------------------------------------------------------
     def refresh_list(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -1092,9 +1173,6 @@ class SpotifySyncApp:
         except Exception:
             return {"tracks": "-", "local": "-", "last": "Nunca", "status": "Error"}
 
-    # ------------------------------------------------------------------
-    # Acciones de playlist
-    # ------------------------------------------------------------------
     def add_playlist(self):
         url = simpledialog.askstring("Agregar Playlist", "URL de Spotify:", parent=self.root)
         if not url:
@@ -1111,7 +1189,6 @@ class SpotifySyncApp:
             self.refresh_list()
             self.status_var.set(f"✅ Agregado: {name or pl.name} ({pl.total_tracks} tracks)")
 
-            # El Auto-Sync se activa de inmediato al agregar una playlist
             if not self.engine.is_daemon_running():
                 self.start_autosync()
             else:
@@ -1183,15 +1260,17 @@ class SpotifySyncApp:
         self._safe(lambda: self.progress_label.configure(text="Listo"))
         self._safe(self.refresh_list)
 
-    # ------------------------------------------------------------------
-    # Auto-Sync (daemon)
-    # ------------------------------------------------------------------
     def start_autosync(self):
         if not self.playlists:
             messagebox.showwarning("Atencion", "Agrega al menos una playlist para iniciar el Auto-Sync.")
             return
         self._apply_settings_to_config()
-        self.engine = SyncEngine(self.config, progress_cb=self.on_progress, status_cb=self.on_status)
+        self.engine = SyncEngine(
+            self.config,
+            progress_cb=self.on_progress,
+            status_cb=self.on_status,
+            playlists_source=lambda: list(self.playlists)
+        )
         self.engine.start_daemon(self.playlists)
         self._update_autosync_indicator(True)
         self.settings["auto_sync_enabled"] = True
@@ -1211,9 +1290,6 @@ class SpotifySyncApp:
         else:
             self.start_autosync()
 
-    # ------------------------------------------------------------------
-    # Callbacks de progreso / estado
-    # ------------------------------------------------------------------
     def on_progress(self, current: int, total: int, track_name: str):
         self._safe(lambda: self._update_progress(current, total, track_name))
 
@@ -1241,9 +1317,6 @@ class SpotifySyncApp:
                 pass
         self.root.after(100, self._process_queue)
 
-    # ------------------------------------------------------------------
-    # Cierre / bandeja del sistema
-    # ------------------------------------------------------------------
     def on_close(self):
         if PYSTRAY_AVAILABLE:
             self.hide_to_tray()
@@ -1251,8 +1324,6 @@ class SpotifySyncApp:
             self.exit_app()
 
     def _on_unmap(self, event):
-        """Intercepta el boton "-" de minimizar para enviar la app a la bandeja en vez
-        de dejarla minimizada en la barra de tareas."""
         if event.widget is not self.root:
             return
         if PYSTRAY_AVAILABLE and self.root.state() == "iconic":
