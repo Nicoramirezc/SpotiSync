@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Spotify Sync GUI
+Spotify Sync GUI - Cross-platform (Windows & Linux)
 - Auto-Sync se activa automaticamente al agregar una playlist
 - Intervalo por defecto: 30s
-- Opcion de inicio automatico con Windows (minimizado a la bandeja)
+- Opcion de inicio automatico con el sistema (minimizado a la bandeja)
 - UI mejorada: mas clara, agrupada y con indicadores de estado
 Requiere: pip install requests spotifyscraper yt-dlp pystray Pillow (+ ffmpeg en el PATH)
+
+Linux extra:
+    sudo apt install python3-tk python3-pil.imagetk libappindicator3-1   (Debian/Ubuntu/Mint)
+    sudo pacman -S python tk libappindicator-gtk3                        (Arch)
 """
 
 import gc
@@ -35,87 +39,135 @@ PYSTRAY_AVAILABLE = (
     and importlib.util.find_spec("PIL") is not None
 )
 
+# Windows-only flag
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 CONFIG_FILE = "spotify_sync_config.json"
 APP_STARTUP_NAME = "SpotifySync"
+IS_WINDOWS = os.name == "nt"
+IS_LINUX = sys.platform.startswith("linux")
 
 
 # ---------------------------------------------------------------------------
-# Inicio automatico con Windows (registro HKCU\...\Run)
+# Inicio automatico con el sistema (Windows: registro | Linux: .desktop)
 # ---------------------------------------------------------------------------
 
 def _run_vbs_path() -> Path:
     return Path(__file__).resolve().parent / "run.vbs"
 
 
+def _desktop_entry_path() -> Path:
+    """Ruta al archivo .desktop para autostart en Linux."""
+    autostart_dir = Path.home() / ".config" / "autostart"
+    autostart_dir.mkdir(parents=True, exist_ok=True)
+    return autostart_dir / f"{APP_STARTUP_NAME}.desktop"
+
+
 def is_startup_enabled() -> bool:
-    """Indica si el inicio automatico con Windows esta activo actualmente."""
-    if os.name != "nt":
-        return False
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                              r"Software\Microsoft\Windows\CurrentVersion\Run",
-                              0, winreg.KEY_READ)
+    """Indica si el inicio automatico esta activo actualmente."""
+    if IS_WINDOWS:
         try:
-            winreg.QueryValueEx(key, APP_STARTUP_NAME)
-            return True
-        except FileNotFoundError:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                  r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                  0, winreg.KEY_READ)
+            try:
+                winreg.QueryValueEx(key, APP_STARTUP_NAME)
+                return True
+            except FileNotFoundError:
+                return False
+            finally:
+                winreg.CloseKey(key)
+        except Exception:
             return False
-        finally:
-            winreg.CloseKey(key)
-    except Exception:
-        return False
+    elif IS_LINUX:
+        return _desktop_entry_path().exists()
+    return False
 
 
 def get_startup_command() -> Optional[str]:
-    """Devuelve el comando guardado actualmente en el registro de inicio (o None)."""
-    if os.name != "nt":
-        return None
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                              r"Software\Microsoft\Windows\CurrentVersion\Run",
-                              0, winreg.KEY_READ)
+    """Devuelve el comando guardado actualmente (o None)."""
+    if IS_WINDOWS:
         try:
-            value, _ = winreg.QueryValueEx(key, APP_STARTUP_NAME)
-            return value
-        except FileNotFoundError:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                  r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                  0, winreg.KEY_READ)
+            try:
+                value, _ = winreg.QueryValueEx(key, APP_STARTUP_NAME)
+                return value
+            except FileNotFoundError:
+                return None
+            finally:
+                winreg.CloseKey(key)
+        except Exception:
             return None
-        finally:
-            winreg.CloseKey(key)
-    except Exception:
+    elif IS_LINUX:
+        path = _desktop_entry_path()
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("Exec="):
+                            return line.strip()[5:]
+            except Exception:
+                pass
         return None
+    return None
 
 
 def set_startup_enabled(enable: bool) -> bool:
-    """Activa/desactiva el inicio automatico (minimizado) con Windows. True si tuvo exito."""
-    if os.name != "nt":
-        return False
-    try:
-        import winreg
+    """Activa/desactiva el inicio automatico. True si tuvo exito."""
+    if IS_WINDOWS:
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                  r"Software\Microsoft\Windows\CurrentVersion\Run",
-                                  0, winreg.KEY_ALL_ACCESS)
-        except FileNotFoundError:
-            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER,
-                                    r"Software\Microsoft\Windows\CurrentVersion\Run")
+            import winreg
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                      r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                      0, winreg.KEY_ALL_ACCESS)
+            except FileNotFoundError:
+                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                        r"Software\Microsoft\Windows\CurrentVersion\Run")
+            try:
+                if enable:
+                    vbs = _run_vbs_path()
+                    cmd = f'wscript.exe "{vbs}" --minimized'
+                    winreg.SetValueEx(key, APP_STARTUP_NAME, 0, winreg.REG_SZ, cmd)
+                else:
+                    try:
+                        winreg.DeleteValue(key, APP_STARTUP_NAME)
+                    except FileNotFoundError:
+                        pass
+                return True
+            finally:
+                winreg.CloseKey(key)
+        except Exception:
+            return False
+    elif IS_LINUX:
+        desktop_path = _desktop_entry_path()
         try:
             if enable:
-                vbs = _run_vbs_path()
-                cmd = f'wscript.exe "{vbs}" --minimized'
-                winreg.SetValueEx(key, APP_STARTUP_NAME, 0, winreg.REG_SZ, cmd)
+                script_path = Path(__file__).resolve()
+                # Usamos python3 directamente; si se quiere minimizado, se pasa --minimized
+                # y la app ya soporta ese flag.
+                entry = f"""[Desktop Entry]
+Type=Application
+Name=Spotify Sync
+Exec=python3 "{script_path}" --minimized
+Icon=multimedia-player
+Comment=Spotify playlist sync tool
+Terminal=false
+X-GNOME-Autostart-enabled=true
+"""
+                with open(desktop_path, "w", encoding="utf-8") as f:
+                    f.write(entry)
+                os.chmod(desktop_path, 0o644)
             else:
-                try:
-                    winreg.DeleteValue(key, APP_STARTUP_NAME)
-                except FileNotFoundError:
-                    pass
+                if desktop_path.exists():
+                    desktop_path.unlink()
             return True
-        finally:
-            winreg.CloseKey(key)
-    except Exception:
-        return False
+        except Exception:
+            return False
+    return False
 
 
 class ToolTip:
@@ -386,10 +438,15 @@ class Downloader:
         try:
             # No capturamos stdout/stderr (no se usan): evita acumular en RAM
             # toda la salida de texto de yt-dlp durante la descarga.
-            result = subprocess.run(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=300, creationflags=CREATE_NO_WINDOW
-            )
+            kwargs = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "timeout": 300,
+            }
+            if IS_WINDOWS:
+                kwargs["creationflags"] = CREATE_NO_WINDOW
+
+            result = subprocess.run(cmd, **kwargs)
             if result.returncode != 0:
                 return self._retry(track)
             downloaded = self.find_existing(track)
@@ -414,10 +471,15 @@ class Downloader:
                 f"ytsearch1:{q}",
             ]
             try:
-                result = subprocess.run(
-                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=300, creationflags=CREATE_NO_WINDOW
-                )
+                kwargs = {
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                    "timeout": 300,
+                }
+                if IS_WINDOWS:
+                    kwargs["creationflags"] = CREATE_NO_WINDOW
+
+                result = subprocess.run(cmd, **kwargs)
                 if result.returncode == 0:
                     existing = self.find_existing(track)
                     if existing:
@@ -679,7 +741,7 @@ class SpotifySyncApp:
         if self.settings.get("auto_sync_enabled") and self.playlists:
             self.root.after(400, self.start_autosync)
 
-        # Si se lanzo con --minimized (p.ej. al iniciar Windows), ocultar a la bandeja
+        # Si se lanzo con --minimized (p.ej. al iniciar el sistema), ocultar a la bandeja
         if start_minimized:
             self.root.after(700, lambda: self.hide_to_tray(silent=True))
 
@@ -708,17 +770,28 @@ class SpotifySyncApp:
         if importlib.util.find_spec("spotify_scraper") is None:
             missing.append("spotifyscraper")
         try:
-            subprocess.run(["yt-dlp", "--version"], stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, check=True, creationflags=CREATE_NO_WINDOW)
+            kwargs = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "check": True,
+            }
+            if IS_WINDOWS:
+                kwargs["creationflags"] = CREATE_NO_WINDOW
+            subprocess.run(["yt-dlp", "--version"], **kwargs)
         except Exception:
             missing.append("yt-dlp")
         if not PYSTRAY_AVAILABLE:
             missing.append("pystray")
         if missing:
+            extra_msg = ""
+            if IS_LINUX:
+                extra_msg = ("\n\nEn Linux, asegurate de tener tambien:\n"
+                             "  sudo apt install python3-tk libappindicator3-1   (Debian/Ubuntu/Mint)\n"
+                             "  sudo pacman -S python tk libappindicator-gtk3      (Arch)")
             messagebox.showwarning(
                 "Dependencias faltantes",
                 f"Faltan los siguientes paquetes: {', '.join(missing)}\n\n"
-                f"Instalalos con:\npip install {' '.join(missing)}"
+                f"Instalalos con:\npip install {' '.join(missing)}{extra_msg}"
             )
 
     # ------------------------------------------------------------------
@@ -887,15 +960,16 @@ class SpotifySyncApp:
         sf.grid(row=0, column=1, sticky="nsew")
 
         self.startup_var = tk.BooleanVar(value=is_startup_enabled())
-        chk_startup = ttk.Checkbutton(sf, text="Iniciar con Windows (minimizado)",
+        startup_text = "Iniciar con Windows (minimizado)" if IS_WINDOWS else "Iniciar con el sistema (minimizado)"
+        chk_startup = ttk.Checkbutton(sf, text=startup_text,
                                        variable=self.startup_var, command=self.on_toggle_startup)
         chk_startup.grid(row=0, column=0, sticky="w")
-        ToolTip(chk_startup, "La app arrancara junto con Windows, directo en la bandeja del sistema")
+        ToolTip(chk_startup, "La app arrancara junto con el sistema, directo en la bandeja del sistema")
 
         ttk.Label(sf, text="Reanuda el Auto-Sync automaticamente si estaba activo.",
                   font=("Segoe UI", 8), foreground="#666666", wraplength=220, justify="left").grid(
             row=1, column=0, sticky="w", pady=(4, 0))
-        if os.name != "nt":
+        if not (IS_WINDOWS or IS_LINUX):
             chk_startup.configure(state="disabled")
 
     def _build_statusbar(self, parent):
@@ -929,27 +1003,33 @@ class SpotifySyncApp:
         self.config.DELETE_REMOVED = self.delete_var.get()
 
     def _repair_startup_entry(self):
-        """Si el inicio automatico con Windows estaba activado en una sesion anterior,
-        vuelve a registrar la ruta actual de run.vbs. Esto evita que el inicio automatico
-        deje de funcionar si la carpeta del programa fue movida o renombrada."""
-        if os.name != "nt" or not self.settings.get("start_with_windows"):
+        """Si el inicio automatico estaba activado en una sesion anterior,
+        vuelve a registrar la ruta actual. Esto evita que deje de funcionar
+        si la carpeta del programa fue movida o renombrada."""
+        if not self.settings.get("start_with_windows"):
             return
-        expected_cmd = f'wscript.exe "{_run_vbs_path()}" --minimized'
-        if get_startup_command() != expected_cmd:
-            set_startup_enabled(True)
+        if IS_WINDOWS:
+            expected_cmd = f'wscript.exe "{_run_vbs_path()}" --minimized'
+            if get_startup_command() != expected_cmd:
+                set_startup_enabled(True)
+        elif IS_LINUX:
+            expected_cmd = f'python3 "{Path(__file__).resolve()}" --minimized'
+            current = get_startup_command()
+            if current != expected_cmd:
+                set_startup_enabled(True)
 
     def on_toggle_startup(self):
         enable = self.startup_var.get()
         ok = set_startup_enabled(enable)
         if not ok:
             messagebox.showerror("No disponible",
-                                  "No se pudo modificar el inicio automatico con Windows.")
+                                  "No se pudo modificar el inicio automatico.")
             self.startup_var.set(not enable)
             return
         self.settings["start_with_windows"] = enable
         self.save_config()
-        self.status_var.set("✅ Se iniciara minimizado con Windows" if enable
-                             else "Inicio automatico con Windows desactivado")
+        self.status_var.set("✅ Se iniciara minimizado con el sistema" if enable
+                             else "Inicio automatico desactivado")
 
     def _update_autosync_indicator(self, running: bool):
         if running:
@@ -1183,7 +1263,10 @@ class SpotifySyncApp:
             if silent:
                 self.root.iconify()
             else:
-                messagebox.showwarning("Bandeja", "pystray no instalado. pip install pystray Pillow")
+                extra = ""
+                if IS_LINUX:
+                    extra = "\n\nEn Linux instala: sudo apt install libappindicator3-1"
+                messagebox.showwarning("Bandeja", f"pystray no instalado. pip install pystray Pillow{extra}")
             return
         self.root.withdraw()
         self._setup_tray()
