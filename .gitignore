@@ -19,6 +19,7 @@ spotify_sync_config.json
 *.opus
 *.ogg
 *.wav
+cookies.txt
 
 # Sistema
 Thumbs.db
