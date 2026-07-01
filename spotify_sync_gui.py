@@ -12,8 +12,8 @@ Linux extra:
     sudo pacman -S python tk libappindicator-gtk3                        (Arch)
 """
 
-import gc
 import json
+import logging
 import os
 import re
 import subprocess
@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,20 @@ from typing import List, Optional, Dict, Any, Callable
 import importlib.util
 
 import requests
+
+# ---------------------------------------------------------------------------
+# Logging: en vez de tragar errores en silencio (except: pass), quedan
+# registrados en un archivo junto al script. No es intrusivo (no abre
+# consola) y ayuda muchisimo a diagnosticar fallos de yt-dlp/red/etc.
+# ---------------------------------------------------------------------------
+LOG_FILE = Path(__file__).resolve().parent / "spotify_sync.log"
+logging.basicConfig(
+    filename=str(LOG_FILE),
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    encoding="utf-8",
+)
+logger = logging.getLogger("spotify_sync")
 
 # Solo comprobamos que esten instalados (sin importarlos todavia) para no cargar
 # pystray/Pillow en memoria hasta el momento en que realmente se minimice a la
@@ -41,7 +56,7 @@ PYSTRAY_AVAILABLE = (
 
 # Windows-only flag
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-CONFIG_FILE = "spotify_sync_config.json"
+CONFIG_FILE = str(Path(__file__).resolve().parent / "spotify_sync_config.json")
 APP_STARTUP_NAME = "SpotifySync"
 IS_WINDOWS = os.name == "nt"
 IS_LINUX = sys.platform.startswith("linux")
@@ -389,14 +404,35 @@ class SpotifyExtractor:
 
 
 class Downloader:
+    # Extensiones que SIEMPRE son basura, sin importar el formato de audio
+    # configurado: miniaturas sueltas y archivos de descarga incompleta.
+    ALWAYS_JUNK_EXTENSIONS = {
+        ".jpg", ".jpeg", ".png", ".webp",   # miniaturas sueltas
+        ".part", ".ytdl", ".temp", ".tmp",  # descargas/fragmentos incompletos
+    }
+    # Contenedores "crudos" (el audio tal cual lo entrega YouTube/SoundCloud
+    # ANTES de convertirlo al formato final). yt-dlp los borra solo al
+    # terminar, pero si el proceso se corta a mitad de camino (un 403/416,
+    # timeout, corte de red) pueden quedar sueltos junto al .mp3 ya creado.
+    # Se excluye dinamicamente el que coincide con el formato final
+    # configurado, para no borrar nunca el archivo bueno.
+    RAW_CONTAINER_EXTENSIONS = {
+        ".webm", ".m4a", ".opus", ".ogg", ".aac", ".wav", ".flac", ".mp4", ".mkv", ".3gp"
+    }
+
     def __init__(self, output_dir: Path, config: Config, error_cb: Optional[Callable[[str], None]] = None):
         self.output_dir = output_dir
         self.config = config
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._error_cb = error_cb
 
+    def _junk_extensions(self) -> set:
+        final_ext = f".{self.config.OUTPUT_FORMAT.lower().strip()}"
+        return self.ALWAYS_JUNK_EXTENSIONS | (self.RAW_CONTAINER_EXTENSIONS - {final_ext})
+
     def _cookies_args(self) -> List[str]:
-        """Devuelve --cookies cookies.txt si existe en la carpeta del script."""
+        """Devuelve --cookies cookies.txt si existe en la carpeta del script.
+        Solo aplica a YouTube (el archivo esta pensado para ese dominio)."""
         cookies = Path(__file__).resolve().parent / "cookies.txt"
         if cookies.exists():
             return ["--cookies", str(cookies)]
@@ -428,27 +464,81 @@ class Downloader:
                 return candidate
         return None
 
-    def download(self, track: Track) -> Optional[Path]:
-        existing = self.find_existing(track)
-        if existing and self.config.SKIP_EXISTING:
-            return existing
+    def cleanup_track_junk(self, track: Track):
+        """Borra miniaturas/.part/.webm/etc sueltos que hayan quedado de esta
+        pista. Se llama SIEMPRE despues de intentar descargar, haya salido
+        bien o mal.
 
+        IMPORTANTE: yt-dlp arma los nombres temporales pegando cosas al final
+        del nombre base, ej: 'Cancion - Artista.f251.webm.part'. Comparar el
+        stem exacto (como se hacia antes) no detecta esos casos porque el
+        "stem" real es 'Cancion - Artista.f251.webm', no 'Cancion - Artista'.
+        Por eso aqui se compara por PREFIJO: cualquier archivo cuyo nombre
+        empiece con '<nombre de la pista>.' y termine en una extension de
+        basura se borra, sin importar que haya tokens intermedios.
+        """
+        prefixes = (f"{track.safe_filename}.", f"{track.legacy_safe_filename}.")
+        junk_exts = self._junk_extensions()
+        try:
+            for f in self.output_dir.iterdir():
+                if not f.is_file():
+                    continue
+                if not f.name.startswith(prefixes):
+                    continue
+                if f.suffix.lower() in junk_exts:
+                    try:
+                        f.unlink()
+                        logger.info("Limpieza: eliminado archivo huerfano %s", f.name)
+                    except OSError as e:
+                        logger.warning("No se pudo borrar huerfano %s: %s", f.name, e)
+        except Exception as e:
+            logger.warning("Error listando %s para limpieza: %s", self.output_dir, e)
+
+    def _attempt(self, track: Track, search_prefix: str, query: str) -> Optional[Path]:
+        """Un unico intento de descarga contra un extractor/consulta dados.
+        search_prefix es el prefijo de busqueda de yt-dlp: 'ytsearch1' para
+        YouTube o 'scsearch1' para SoundCloud (ambos incluidos gratis en
+        yt-dlp, sin API key)."""
         output_template = str(self.output_dir / f"{track.safe_filename}.%(ext)s")
+        is_youtube = search_prefix.startswith("yt")
 
         cmd = [
             "yt-dlp", "-x", "--audio-format", self.config.OUTPUT_FORMAT,
             "--audio-quality", self.config.AUDIO_QUALITY, "-o", output_template,
             "--format", "bestaudio/best",
-            *self._cookies_args(),
+        ]
+        if is_youtube:
+            cmd += self._cookies_args()
+        cmd += [
             "--embed-metadata", "--embed-thumbnail", "--add-metadata",
+            # webp -> jpg calidad maxima: evita fallos de embebido en mp3
+            # (ID3 no soporta bien webp) y la perdida de nitidez del
+            # compresor jpeg por defecto de ffmpeg.
+            "--convert-thumbnails", "jpg",
+            "--postprocessor-args", "ThumbnailsConvertor:-qmin 1 -qmax 1",
             "--parse-metadata", "%(title)s:%(meta_title)s",
             "--parse-metadata", "%(uploader)s:%(meta_artist)s",
-            "--sponsorblock-remove", "all",
-            "--concurrent-fragments", str(self.config.THREADS),
+        ]
+        if is_youtube:
+            cmd += ["--sponsorblock-remove", "all"]
+        cmd += [
+            "--concurrent-fragments", str(min(self.config.THREADS, 4)),
+            "--no-keep-video",
+            # --no-continue: nunca intenta reanudar un .part con un Range
+            # request. Reanudar es la causa mas comun del error 416 (el
+            # enlace firmado de googlevideo.com que dejo el intento anterior
+            # ya vencio, y pedir "el resto" de un archivo con una URL vieja
+            # el servidor lo rechaza). Mejor reiniciar limpio cada vez.
+            "--no-continue",
+            # Reintentos generosos a nivel de yt-dlp para transitorios
+            # (403/429 suelen ser bloqueos temporales que un retry con
+            # backoff resuelve solo).
+            "--retries", "10", "--fragment-retries", "10", "--extractor-retries", "3",
+            "--sleep-requests", "1",
             "--no-overwrites", "--ignore-errors", "--no-progress",
             "--no-warnings", "--quiet",
-            "--default-search", "ytsearch1",
-            f"ytsearch1:{track.search_query}",
+            "--default-search", search_prefix,
+            f"{search_prefix}:{query}",
         ]
         if self.config.YTDLP_EXTRA:
             cmd.extend(self.config.YTDLP_EXTRA.split())
@@ -465,52 +555,152 @@ class Downloader:
             result = subprocess.run(cmd, **kwargs)
             if result.returncode != 0:
                 self._notify_error(result.stderr)
-                return self._retry(track)
-            downloaded = self.find_existing(track)
-            if downloaded:
-                return downloaded
-            return None
+                logger.warning("yt-dlp (%s) fallo para '%s' [query='%s']: %s",
+                                search_prefix, track.display_name, query,
+                                result.stderr.decode("utf-8", errors="ignore")[-300:])
+                return None
+            return self.find_existing(track)
         except Exception:
+            logger.exception("Excepcion descargando '%s' via %s", track.display_name, search_prefix)
             return None
+        finally:
+            # Pase lo que pase (exito, fallo, timeout, excepcion), nunca debe
+            # quedar una miniatura o un contenedor crudo (.webm, etc) suelto.
+            self.cleanup_track_junk(track)
 
-    def _retry(self, track: Track) -> Optional[Path]:
-        queries = [
-            f"{track.legacy_display_name}",
+    def download(self, track: Track) -> Optional[Path]:
+        existing = self.find_existing(track)
+        if existing and self.config.SKIP_EXISTING:
+            return existing
+
+        youtube_queries = [
+            track.search_query,
+            track.legacy_display_name,
             f"{track.name} {track.artists[0] if track.artists else ''} audio",
         ]
-        for q in queries:
-            output_template = str(self.output_dir / f"{track.safe_filename}.%(ext)s")
-            cmd = [
-                "yt-dlp", "-x", "--audio-format", self.config.OUTPUT_FORMAT,
-                "--audio-quality", self.config.AUDIO_QUALITY, "-o", output_template,
-                "--format", "bestaudio/best",
-                *self._cookies_args(),
-                "--embed-metadata", "--no-overwrites", "--ignore-errors",
-                "--no-warnings", "--quiet", "--default-search", "ytsearch1",
-                f"ytsearch1:{q}",
-            ]
-            if self.config.YTDLP_EXTRA:
-                cmd.extend(self.config.YTDLP_EXTRA.split())
-            try:
-                kwargs = {
-                    "stdout": subprocess.DEVNULL,
-                    "stderr": subprocess.PIPE,
-                    "timeout": 300,
-                }
-                if IS_WINDOWS:
-                    kwargs["creationflags"] = CREATE_NO_WINDOW
+        for i, q in enumerate(youtube_queries):
+            result = self._attempt(track, "ytsearch1", q)
+            if result:
+                return result
+            if i < len(youtube_queries) - 1:
+                time.sleep(1)
 
-                result = subprocess.run(cmd, **kwargs)
-                if result.returncode != 0:
-                    self._notify_error(result.stderr)
-                else:
-                    existing = self.find_existing(track)
-                    if existing:
-                        return existing
-            except Exception:
-                pass
-            time.sleep(1)
-        return None
+        # YouTube fallo en los 3 intentos (tipico si esta devolviendo 403/416
+        # de forma persistente, o sea un bloqueo temporal del IP). Como
+        # respaldo se prueba SoundCloud: es una fuente totalmente
+        # independiente de Google/YouTube, no requiere API key ni cuenta, y
+        # yt-dlp ya trae su extractor integrado (gratis y de codigo abierto,
+        # igual que el resto de la herramienta).
+        if self._error_cb:
+            self._error_cb(f"YouTube no disponible para '{track.display_name}', probando SoundCloud...")
+        logger.info("YouTube agotado para '%s', probando SoundCloud como respaldo", track.display_name)
+        return self._attempt(track, "scsearch1", f"{track.legacy_display_name} audio")
+
+
+def cleanup_orphan_files(output_dir: Path, config: Config) -> int:
+    """Barrido general de la carpeta de salida: borra cualquier miniatura o
+    contenedor crudo suelto (.jpg/.webp/.part/.webm/etc), incluyendo los que
+    hayan quedado de sincronizaciones anteriores a este fix. Se excluye
+    dinamicamente la extension del formato final configurado (config.OUTPUT_FORMAT)
+    para no tocar nunca los archivos de audio buenos."""
+    final_ext = f".{config.OUTPUT_FORMAT.lower().strip()}"
+    junk_exts = Downloader.ALWAYS_JUNK_EXTENSIONS | (Downloader.RAW_CONTAINER_EXTENSIONS - {final_ext})
+    removed = 0
+    try:
+        for f in output_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in junk_exts:
+                try:
+                    f.unlink()
+                    removed += 1
+                except OSError as e:
+                    logger.warning("No se pudo borrar huerfano %s: %s", f.name, e)
+    except Exception as e:
+        logger.warning("Error en barrido de huerfanos de %s: %s", output_dir, e)
+    if removed:
+        logger.info("Barrido de %s: %d archivo(s) huerfano(s) eliminado(s)", output_dir, removed)
+    return removed
+
+
+def _set_windows_creation_time(path: Path, dt: datetime):
+    """En Windows, 'Fecha de creacion' es un atributo aparte de la fecha de
+    modificacion y Python no lo expone via os.utime. Se ajusta con la API
+    nativa de Windows (kernel32) usando solo ctypes, que ya viene en la
+    libreria estandar (no agrega dependencias nuevas)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+
+        handle = ctypes.windll.kernel32.CreateFileW(
+            str(path), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None
+        )
+        if handle == -1 or handle == 0:
+            return
+
+        # FILETIME cuenta intervalos de 100ns desde el 1/1/1601, mientras que
+        # datetime.timestamp() cuenta segundos desde el 1/1/1970 (epoch Unix).
+        EPOCH_AS_FILETIME = 116444736000000000
+        HUNDREDS_OF_NS = 10_000_000
+        ticks = int(dt.timestamp() * HUNDREDS_OF_NS) + EPOCH_AS_FILETIME
+        creation_time = wintypes.FILETIME(ticks & 0xFFFFFFFF, ticks >> 32)
+
+        ctypes.windll.kernel32.SetFileTime(handle, ctypes.byref(creation_time), None, None)
+        ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception as e:
+        logger.warning("No se pudo ajustar fecha de creacion de %s: %s", path, e)
+
+
+def reorder_files_by_playlist(tracks: List[Track], files_map: Dict[str, str], output_dir: Path) -> int:
+    """Reasigna la fecha de modificacion (y de creacion en Windows) de cada
+    archivo ya descargado siguiendo el ORDEN de la lista `tracks`, que viene
+    directamente de Spotify en el orden real de la playlist.
+
+    Por que hace falta: antes, al descargar una cancion a la vez, los
+    archivos quedaban creados en orden y por lo tanto el explorador de
+    archivos (ordenando por fecha) mostraba el mismo orden que la playlist.
+    Con descargas en paralelo eso ya no se puede garantizar, asi que en vez
+    de depender del orden de creacion real, se fuerza manualmente: a la
+    primera cancion de la playlist se le pone la fecha mas antigua, a la
+    ultima la mas reciente, con 1 segundo de diferencia entre cada una.
+
+    No renombra ni mueve archivos, solo toca metadatos de fecha.
+    """
+    ordered_paths: List[Path] = []
+    for t in tracks:
+        fname = files_map.get(t.id)
+        if not fname:
+            continue
+        p = output_dir / fname
+        if p.exists():
+            ordered_paths.append(p)
+
+    if not ordered_paths:
+        return 0
+
+    # Ancla en el pasado (no en el futuro) para que no se vea raro en
+    # exploradores que muestran "hace X minutos", y para no chocar con el
+    # reloj del sistema si hay pequenas variaciones entre llamadas.
+    base_ts = time.time() - len(ordered_paths) - 5
+    updated = 0
+    for i, path in enumerate(ordered_paths):
+        ts = base_ts + i
+        try:
+            os.utime(path, (ts, ts))
+            if IS_WINDOWS:
+                _set_windows_creation_time(path, datetime.fromtimestamp(ts))
+            updated += 1
+        except Exception as e:
+            logger.warning("No se pudo reordenar fecha de %s: %s", path, e)
+
+    if updated:
+        logger.info("Reordenadas %d fecha(s) de archivo segun orden de playlist en %s", updated, output_dir)
+    return updated
 
 
 class SyncEngine:
@@ -535,16 +725,16 @@ class SyncEngine:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("No se pudo leer estado de %s: %s", playlist_id, e)
         return {"track_ids": [], "files": {}, "snapshot_id": ""}
 
     def _save_state(self, playlist_id: str, state: dict):
         try:
             with open(self._state_file(playlist_id), "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("No se pudo guardar estado de %s: %s", playlist_id, e)
 
     def _filter_track(self, track: Track) -> bool:
         if self.config.SKIP_EXPLICIT and track.explicit:
@@ -575,6 +765,13 @@ class SyncEngine:
         new_ids = current_ids - prev_ids
         removed_ids = prev_ids - current_ids
 
+        # Orden previo guardado (lista, no set, para poder comparar secuencia).
+        # Filtramos ids que ya no existen para comparar solo lo comparable.
+        prev_order_raw = state.get("track_order", [])
+        prev_order = [tid for tid in prev_order_raw if tid in current_ids]
+        current_order = [t.id for t in tracks]
+        order_changed = current_order != prev_order
+
         missing_files = []
         for tid, fname in prev_files.items():
             if tid in current_ids and not (output_dir / fname).exists():
@@ -586,10 +783,10 @@ class SyncEngine:
                 if track.id not in missing_files:
                     missing_files.append(track.id)
 
-        has_changes = bool(new_ids or removed_ids or missing_files or force)
+        has_changes = bool(new_ids or removed_ids or missing_files or force or order_changed)
 
         if self.status_cb:
-            self.status_cb("", f"Playlist: {playlist.name} | Tracks: {len(tracks)} | Nuevas: {len(new_ids)} | Eliminar: {len(removed_ids)} | Faltan: {len(missing_files)}")
+            self.status_cb("", f"Playlist: {playlist.name} | Tracks: {len(tracks)} | Nuevas: {len(new_ids)} | Eliminar: {len(removed_ids)} | Faltan: {len(missing_files)} | Orden cambio: {'si' if order_changed else 'no'}")
 
         if not has_changes:
             self._save_state(playlist_id, {
@@ -597,6 +794,7 @@ class SyncEngine:
                 "last_sync": datetime.now().isoformat(),
                 "snapshot_id": playlist.snapshot_id,
                 "track_ids": list(current_ids),
+                "track_order": current_order,
                 "files": {tid: fname for tid, fname in prev_files.items() if tid in current_ids and (output_dir / fname).exists()}
             })
             return {"status": "no_changes", "playlist_name": playlist.name, "total_tracks": len(tracks)}
@@ -616,32 +814,49 @@ class SyncEngine:
 
         downloaded = 0
         failed = 0
+        completed = 0
+        progress_lock = threading.Lock()
+        cancelled = False
 
-        for i, track in enumerate(tracks_to_download):
+        def _should_abort() -> bool:
             if stop_event is not None and stop_event.is_set():
-                if self.status_cb:
-                    self.status_cb("", "Cancelado por el usuario")
-                break
-
+                return True
             if self._playlists_source is not None:
                 active_urls = {p["url"] for p in self._playlists_source()}
                 if playlist_url not in active_urls:
-                    if self.status_cb:
-                        self.status_cb("", "Playlist eliminada, deteniendo sincronizacion")
-                    break
+                    return True
+            return False
 
-            if self.progress_cb:
-                self.progress_cb(i + 1, total_to_download, track.display_name)
-
+        def _download_one(track: Track):
+            # Se revisa tambien aqui (no solo antes de encolar) porque con
+            # varios workers en paralelo, tareas ya encoladas pueden empezar
+            # a ejecutarse despues de que el usuario cancelo o borro la playlist.
+            if _should_abort():
+                return track, None, True
             result = downloader.download(track)
-            if result:
-                files_map[track.id] = str(result.name)
-                downloaded += 1
-            else:
-                failed += 1
+            return track, result, False
 
-            if stop_event is not None and stop_event.wait(1.5):
-                break
+        max_workers = max(1, min(self.config.THREADS, total_to_download)) if total_to_download else 1
+        if total_to_download:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="dl") as executor:
+                futures = {executor.submit(_download_one, t): t for t in tracks_to_download}
+                for future in as_completed(futures):
+                    track, result, skipped = future.result()
+                    with progress_lock:
+                        completed += 1
+                        if self.progress_cb:
+                            self.progress_cb(completed, total_to_download, track.display_name)
+                    if skipped:
+                        cancelled = True
+                        continue
+                    if result:
+                        files_map[track.id] = str(result.name)
+                        downloaded += 1
+                    else:
+                        failed += 1
+
+        if cancelled and self.status_cb:
+            self.status_cb("", "Sincronizacion cancelada o playlist eliminada")
 
         deleted = 0
         if self.config.DELETE_REMOVED:
@@ -652,8 +867,8 @@ class SyncEngine:
                         try:
                             file_path.unlink()
                             deleted += 1
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning("No se pudo borrar %s: %s", file_path, e)
                     if rid in files_map:
                         del files_map[rid]
 
@@ -662,10 +877,19 @@ class SyncEngine:
             "last_sync": datetime.now().isoformat(),
             "snapshot_id": playlist.snapshot_id,
             "track_ids": list(current_ids),
+            "track_order": current_order,
             "files": {tid: fname for tid, fname in files_map.items() if tid in current_ids}
         })
 
-        gc.collect()
+        # Como las descargas van en paralelo, el orden en que los archivos
+        # terminan de crearse ya no coincide con el orden de la playlist.
+        # Se reasignan las fechas de los archivos para que, ordenando por
+        # fecha en el explorador, la carpeta quede igual que en Spotify.
+        reordered = reorder_files_by_playlist(tracks, files_map, output_dir)
+
+        # Barrido final: por si quedo algo suelto (miniaturas, .part) de esta
+        # sesion o de sincronizaciones viejas anteriores a este fix.
+        cleanup_orphan_files(output_dir, self.config)
 
         return {
             "playlist_name": playlist.name,
@@ -675,6 +899,7 @@ class SyncEngine:
             "deleted": deleted,
             "skipped_filters": skipped,
             "already_have": len(tracks) - total_to_download,
+            "reordered": reordered,
             "output_dir": str(output_dir)
         }
 
@@ -702,7 +927,7 @@ class SyncEngine:
                         elif result.get("status") == "no_changes":
                             self.status_cb(pl.get("name", ""), "Sin cambios")
                         else:
-                            self.status_cb(pl.get("name", ""), f"+{result['downloaded']} -{result['deleted']} fail:{result['failed']} have:{result['already_have']}")
+                            self.status_cb(pl.get("name", ""), f"+{result['downloaded']} -{result['deleted']} fail:{result['failed']} have:{result['already_have']} orden:{result.get('reordered', 0)}")
                 except Exception as e:
                     if self.status_cb:
                         self.status_cb(pl.get("name", ""), f"Error: {str(e)[:50]}")
@@ -835,15 +1060,16 @@ class SpotifySyncApp:
                     data = json.load(f)
                     self.playlists = data.get("playlists", [])
                     self.settings.update(data.get("settings", {}))
-            except Exception:
+            except Exception as e:
+                logger.warning("No se pudo cargar %s: %s", CONFIG_FILE, e)
                 self.playlists = []
 
     def save_config(self):
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump({"playlists": self.playlists, "settings": self.settings}, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("No se pudo guardar %s: %s", CONFIG_FILE, e)
 
     def build_ui(self):
         self.root.configure(bg=COLOR_BG_HEADER)
@@ -903,6 +1129,10 @@ class SpotifySyncApp:
         b_force = ttk.Button(tb, text="⬇ Forzar Descarga", style="Toolbar.TButton", command=self.force_download)
         b_force.pack(side="left", padx=4)
         ToolTip(b_force, "Reescanea toda la playlist seleccionada, conservando archivos existentes")
+
+        b_update = ttk.Button(tb, text="⟳ Actualizar yt-dlp", style="Toolbar.TButton", command=self.update_ytdlp)
+        b_update.pack(side="left", padx=4)
+        ToolTip(b_update, "YouTube cambia seguido; una version vieja de yt-dlp es la causa mas comun de errores 403/416. Actualizalo cada tanto.")
 
         self.btn_daemon = ttk.Button(tb, text="▶ Iniciar Auto-Sync", style="Primary.TButton", command=self.toggle_daemon)
         self.btn_daemon.pack(side="right")
@@ -1170,6 +1400,33 @@ class SpotifySyncApp:
                 self._safe(lambda: self.status_var.set(f"Error: {e}"))
         threading.Thread(target=run, daemon=True).start()
 
+    def update_ytdlp(self):
+        """Actualiza yt-dlp via pip. YouTube cambia su reproductor con
+        frecuencia y rompe versiones viejas de yt-dlp, lo cual es la causa
+        mas comun de errores 403/416 persistentes. Mantenerlo al dia
+        resuelve la gran mayoria de esos casos sin tocar nada mas."""
+        self.status_var.set("⟳ Actualizando yt-dlp...")
+
+        def run():
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result.returncode == 0:
+                    last_line = next((l for l in reversed(result.stdout.strip().splitlines()) if l.strip()), "OK")
+                    self._safe(lambda: self.status_var.set(f"✅ yt-dlp actualizado: {last_line[:80]}"))
+                    logger.info("yt-dlp actualizado correctamente: %s", last_line)
+                else:
+                    err = (result.stderr or result.stdout).strip().splitlines()
+                    last = err[-1] if err else "error desconocido"
+                    self._safe(lambda: self.status_var.set(f"❌ No se pudo actualizar yt-dlp: {last[:80]}"))
+                    logger.warning("Fallo actualizando yt-dlp: %s", last)
+            except Exception as e:
+                self._safe(lambda: self.status_var.set(f"❌ Error actualizando yt-dlp: {e}"))
+                logger.exception("Excepcion actualizando yt-dlp")
+        threading.Thread(target=run, daemon=True).start()
+
     def _run_sync(self, pl: dict, force: bool):
         def run():
             self._safe(lambda: self.status_var.set(f"🔄 Sincronizando: {pl.get('name', '')}..."))
@@ -1188,7 +1445,7 @@ class SpotifySyncApp:
         elif result.get("status") == "no_changes":
             msg = f"✅ Sin cambios ({result.get('total_tracks', 0)} tracks)"
         else:
-            msg = f"⬇ +{result.get('downloaded', 0)} descargados, -{result.get('deleted', 0)} eliminados, {result.get('failed', 0)} fallos, {result.get('already_have', 0)} ya tenias"
+            msg = f"⬇ +{result.get('downloaded', 0)} descargados, -{result.get('deleted', 0)} eliminados, {result.get('failed', 0)} fallos, {result.get('already_have', 0)} ya tenias, {result.get('reordered', 0)} reordenados"
         self._safe(lambda: self.status_var.set(f"[{name}] {msg}" if name else msg))
         self._safe(lambda: self.progress_var.set(0))
         self._safe(lambda: self.progress_label.configure(text="Listo"))
