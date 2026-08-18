@@ -60,9 +60,7 @@ sudo pacman -S python tk libappindicator-gtk3
 python spotify_sync_gui.py
 ```
 
-En Windows también puedes usar `run.bat` (doble clic) — a diferencia de
-`run.vbs`, este sí muestra una consola, así que si algo falla verás el
-error en pantalla en lugar de que la ventana simplemente no aparezca.
+En Windows puedes usar `run.vbs`
 
 1. Clic en **+ Agregar**, pega la URL de una playlist pública de Spotify.
 2. El Auto-Sync se activa solo al agregar la primera playlist.
@@ -81,51 +79,6 @@ error en pantalla en lugar de que la ventana simplemente no aparezca.
 - **Ver faltantes / huérfanos**: lista canciones de la playlist sin archivo
   local, y archivos locales que ya no están en la playlist.
 - **Actualizar yt-dlp**: actualiza yt-dlp a la última versión.
-
-## ¿Por qué no abre al hacer doble clic en el `.py`?
-
-Casi siempre es por una de estas dos razones:
-
-1. **Falta una dependencia** (`pip install -r requirements.txt` no se
-   corrió, o se corrió con un Python distinto al que usa el doble clic).
-   Si te pasa, ahora la propia app te avisa con un cuadro de diálogo
-   explicando qué falta — antes fallaba en silencio porque Windows suele
-   abrir los `.py` con `pythonw.exe`, que no tiene consola donde mostrar
-   el error.
-2. **Windows asocia `.py` con `pythonw.exe`** en vez de `python.exe`, así
-   que si hay un error que la app no logra atrapar, no ves nada.
-
-**No necesitas compilar un `.exe` para que esto funcione.** Opciones, de
-más simple a más "a prueba de todo":
-
-- **Doble clic normal en `spotify_sync_gui.py`**: debería bastar si Python
-  está instalado y las dependencias también. Es el caso normal.
-- **`run.bat`** (incluido): abre una consola visible y hace `pause` si algo
-  falla, para que puedas leer el error. Bueno para diagnosticar.
-- **Revisa `spotify_sync.log`**: todo error queda registrado ahí, se vea o
-  no en pantalla.
-- **Empaquetarlo como `.exe`** (opcional, no obligatorio): útil solo si vas
-  a compartir la app con alguien que no tiene Python instalado. Con
-  [PyInstaller](https://pyinstaller.org/):
-
-  ```bash
-  pip install pyinstaller
-  pyinstaller --onefile --windowed --name "SpotifySync" spotify_sync_gui.py
-  ```
-
-  El ejecutable queda en `dist/SpotifySync.exe`. Nota: `ffmpeg.exe` y
-  `spotify_sync_config.json` no se empaquetan solos — cópialos junto al
-  `.exe` en `dist/`, o ajusta las rutas si prefieres que sean fijas.
-
-### ¿Y `run.vbs`?
-
-`run.vbs` **no es para uso manual**. La app lo usa internamente solo para
-la opción **"Iniciar con el sistema (minimizado)"**: crea una entrada en
-el Registro de Windows que ejecuta
-`wscript.exe run.vbs --minimized`, que a su vez lanza
-`pythonw spotify_sync_gui.py --minimized` sin ninguna ventana de consola
-(por eso usa `.vbs` y no llama a Python directo). Si no usas esa opción,
-puedes ignorar `run.vbs` por completo.
 
 ## Estructura del proyecto
 
