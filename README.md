@@ -1,158 +1,170 @@
-# 🎵 Spotify Sync GUI
+# Spotify Sync
 
-Aplicación de escritorio (Windows) que descarga y mantiene sincronizadas tus playlists de Spotify de forma automática, usando YouTube como fuente de audio. Incluye interfaz gráfica, sincronización periódica en segundo plano, icono en la bandeja del sistema e inicio automático con Windows.
+Descarga y mantiene sincronizadas tus playlists de Spotify como archivos de
+audio locales (MP3/M4A/FLAC/Opus), con portadas y metadatos correctos.
+Detecta canciones nuevas, eliminadas y reordenadas automáticamente, en
+segundo plano, con una interfaz de escritorio simple.
 
-> ⚠️ **Aviso legal:** esta herramienta extrae metadatos de Spotify sin usar su API oficial (vía `spotifyscraper`) y descarga el audio desde YouTube (vía `yt-dlp`). Úsala únicamente para contenido del que tengas derecho a hacer copias personales, y respeta los Términos de Servicio de Spotify/YouTube y las leyes de derechos de autor de tu país. Este proyecto es de uso personal/educativo.
+![Estado](https://img.shields.io/badge/plataforma-Windows%20%7C%20Linux-blue)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 
----
+## Características
 
-## ✨ Características
+- **Auto-Sync**: revisa tus playlists cada X segundos (configurable) y
+  descarga lo nuevo, borra lo que quitaste de Spotify y reordena los
+  archivos según el orden actual de la playlist.
+- **Metadatos y portada correctos**: título, artista, álbum, número de
+  pista y carátula se incrustan en el archivo de audio.
+- **Multi-formato**: mp3, m4a, flac u opus.
+- **Corrección de metadatos** y **detección de archivos faltantes/huérfanos**
+  para playlists que ya tenías descargadas por fuera de la app.
+- **Inicio con el sistema** (minimizado a la bandeja) tanto en Windows como
+  en Linux.
+- **Multiplataforma**: Windows y Linux (X11/GTK).
 
-- **Auto-Sync automático**: al agregar una playlist se activa la sincronización automática de inmediato, sin pasos extra.
-- **Sincronización periódica** configurable (por defecto cada **30 segundos**).
-- **Detecta cambios reales**: agrega canciones nuevas, elimina las que ya no están en la playlist (opcional) y repara archivos faltantes.
-- **Icono en la bandeja del sistema**: al cerrar (✕) o minimizar (−) la ventana, la app sigue funcionando en segundo plano desde la bandeja. La única forma de cerrarla del todo es con "Salir" desde el menú de la bandeja.
-- **Doble clic en el icono de la bandeja** vuelve a abrir la ventana.
-- **Inicio automático con Windows**, arrancando minimizado directo en la bandeja.
-- **Interfaz clara**: estado de cada playlist (OK / desfase / error / nuevo), progreso de descarga en vivo, y todos los ajustes agrupados y explicados.
+## Requisitos
 
----
+- Python 3.9 o superior.
+- [ffmpeg](https://ffmpeg.org/) instalado y accesible en el `PATH`.
+- Las dependencias de `requirements.txt` (ver más abajo).
 
-## 📋 Requisitos
-
-### Sistema operativo
-- **Windows 10/11** (recomendado). Las funciones de bandeja del sistema e inicio automático usan el registro de Windows (`winreg`) y `wscript.exe`, por lo que esas dos funciones **no están disponibles en Linux/macOS** (el resto de la app sí podría adaptarse, pero no está pensada para eso).
-
-### Python
-- **Python 3.8 o superior** (recomendado 3.10+).
-- Verifica tu versión con:
-  ```bash
-  python --version
-  ```
-- Asegúrate de que **Tkinter** esté incluido (en Windows viene incluido por defecto con el instalador oficial de [python.org](https://www.python.org/downloads/); marca la casilla "tcl/tk and IDLE" si usas instalación personalizada).
-
-### FFmpeg (obligatorio, fuera de pip)
-`yt-dlp` necesita **FFmpeg** instalado y disponible en el `PATH` del sistema para extraer y convertir el audio (mp3/m4a/flac/opus). Sin FFmpeg, las descargas fallarán silenciosamente.
-
-1. Descarga un build para Windows desde [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (build "essentials" es suficiente).
-2. Descomprime el .zip en, por ejemplo, `C:\ffmpeg`.
-3. Agrega `C:\ffmpeg\bin` a la variable de entorno `PATH`.
-4. Verifica con:
-   ```bash
-   ffmpeg -version
-   ```
-
-### Dependencias de Python (pip)
-
-| Paquete | Para qué se usa |
-|---|---|
-| `requests` | Peticiones HTTP auxiliares |
-| `spotifyscraper` | Extraer metadatos de playlists de Spotify sin necesitar API key |
-| `yt-dlp` | Buscar y descargar el audio desde YouTube |
-| `pystray` | Icono y menú en la bandeja del sistema |
-| `Pillow` | Generar el icono de la bandeja |
-
-Instálalas todas de una vez con el `requirements.txt` incluido:
+## Instalación
 
 ```bash
+git clone https://github.com/tu-usuario/spotify-sync.git
+cd spotify-sync
 pip install -r requirements.txt
 ```
 
-O manualmente:
+### ffmpeg
+
+- **Windows**: `winget install Gyan.FFmpeg`, o descarga el `.exe` desde
+  [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) y
+  colócalo junto a `spotify_sync_gui.py`.
+- **Linux (Debian/Ubuntu/Mint)**: `sudo apt install ffmpeg`
+- **Linux (Arch)**: `sudo pacman -S ffmpeg`
+
+### Extras de Linux (interfaz gráfica y bandeja del sistema)
 
 ```bash
-pip install requests spotifyscraper yt-dlp pystray Pillow
+# Debian/Ubuntu/Mint
+sudo apt install python3-tk python3-pil.imagetk libappindicator3-1
+
+# Arch
+sudo pacman -S python tk libappindicator-gtk3
 ```
 
-> 💡 Si `pip` no es reconocido, usa `python -m pip install ...`. Si tienes varias versiones de Python instaladas, usa `py -3 -m pip install ...` para asegurarte de instalar en la versión correcta.
+## Uso
 
----
-
-## 📁 Estructura del proyecto
-
-```
-spotify-sync/
-├── spotify_sync_gui.py        # Aplicación principal (GUI)
-├── run.vbs                    # Lanzador silencioso (sin consola visible)
-├── requirements.txt           # Dependencias de Python
-├── spotify_sync_config.json   # Se crea automáticamente (playlists + ajustes)
-└── .spotify_sync_state/       # Se crea automáticamente (estado interno por playlist)
+```bash
+python spotify_sync_gui.py
 ```
 
-Los dos últimos se generan solos la primera vez que usas la app — no los crees a mano.
+En Windows también puedes usar `run.bat` (doble clic) — a diferencia de
+`run.vbs`, este sí muestra una consola, así que si algo falla verás el
+error en pantalla en lugar de que la ventana simplemente no aparezca.
 
----
+1. Clic en **+ Agregar**, pega la URL de una playlist pública de Spotify.
+2. El Auto-Sync se activa solo al agregar la primera playlist.
+3. Ajusta el intervalo de sincronización, el formato de salida y si quieres
+   que se borren localmente las canciones que quites de la playlist, desde
+   la sección **Sincronización**.
+4. Activa **Iniciar con el sistema (minimizado)** si quieres que arranque
+   solo, minimizado a la bandeja, cuando enciendas el equipo.
 
-## 🚀 Instalación y primer uso
+### Menú "Más"
 
-1. Instala Python, FFmpeg y las dependencias de pip (pasos de arriba).
-2. Coloca `spotify_sync_gui.py` y `run.vbs` juntos en la carpeta donde quieras que vivan tu configuración y tus descargas.
-3. Ejecuta la app de cualquiera de estas formas:
-   - Doble clic en `run.vbs` (no abre ventana de consola), **o**
-   - Desde una terminal: `python spotify_sync_gui.py`
-4. En la ventana, haz clic en **➕ Agregar Playlist**, pega la URL de Spotify (formato `https://open.spotify.com/playlist/...`), confirma el nombre y la carpeta de destino.
-5. Listo — el Auto-Sync se activa solo y empieza a descargar.
+- **Forzar descarga completa**: descarta el estado guardado de una playlist
+  y vuelve a verificar todos sus archivos.
+- **Corregir metadatos**: re-escribe título/artista/álbum/portada de los
+  archivos ya descargados sin volver a descargarlos.
+- **Ver faltantes / huérfanos**: lista canciones de la playlist sin archivo
+  local, y archivos locales que ya no están en la playlist.
+- **Actualizar yt-dlp**: actualiza yt-dlp a la última versión.
 
----
+## ¿Por qué no abre al hacer doble clic en el `.py`?
 
-## ⚙️ Ajustes disponibles
+Casi siempre es por una de estas dos razones:
 
-| Ajuste | Default | Descripción |
-|---|---|---|
-| Intervalo | **30 s** | Cada cuánto se revisan cambios en las playlists |
-| Formato | mp3 | Formato de audio final (mp3, m4a, flac, opus) |
-| Eliminar canciones quitadas | Activado | Si una canción se quita de la playlist en Spotify, borra también el archivo local |
-| Iniciar con Windows (minimizado) | Desactivado | Agrega la app al inicio de Windows, arrancando directo en la bandeja |
+1. **Falta una dependencia** (`pip install -r requirements.txt` no se
+   corrió, o se corrió con un Python distinto al que usa el doble clic).
+   Si te pasa, ahora la propia app te avisa con un cuadro de diálogo
+   explicando qué falta — antes fallaba en silencio porque Windows suele
+   abrir los `.py` con `pythonw.exe`, que no tiene consola donde mostrar
+   el error.
+2. **Windows asocia `.py` con `pythonw.exe`** en vez de `python.exe`, así
+   que si hay un error que la app no logra atrapar, no ves nada.
 
-Todos los cambios se guardan automáticamente en `spotify_sync_config.json`, no hace falta reiniciar el Auto-Sync para que tomen efecto.
+**No necesitas compilar un `.exe` para que esto funcione.** Opciones, de
+más simple a más "a prueba de todo":
 
----
+- **Doble clic normal en `spotify_sync_gui.py`**: debería bastar si Python
+  está instalado y las dependencias también. Es el caso normal.
+- **`run.bat`** (incluido): abre una consola visible y hace `pause` si algo
+  falla, para que puedas leer el error. Bueno para diagnosticar.
+- **Revisa `spotify_sync.log`**: todo error queda registrado ahí, se vea o
+  no en pantalla.
+- **Empaquetarlo como `.exe`** (opcional, no obligatorio): útil solo si vas
+  a compartir la app con alguien que no tiene Python instalado. Con
+  [PyInstaller](https://pyinstaller.org/):
 
-## 🖥️ Comportamiento de la ventana y la bandeja
+  ```bash
+  pip install pyinstaller
+  pyinstaller --onefile --windowed --name "SpotifySync" spotify_sync_gui.py
+  ```
 
-- **✕ (cerrar)** → minimiza a la bandeja (no cierra la app).
-- **− (minimizar)** → también manda la app a la bandeja en vez de dejarla en la barra de tareas.
-- **Doble clic en el icono de la bandeja** → vuelve a abrir la ventana.
-- **Clic derecho en el icono de la bandeja** → menú con "Abrir", "Sincronizar ahora", "Iniciar/Detener Auto-Sync" y **"Salir"**.
-- La **única forma de cerrar el programa por completo** es "Salir" desde ese menú.
+  El ejecutable queda en `dist/SpotifySync.exe`. Nota: `ffmpeg.exe` y
+  `spotify_sync_config.json` no se empaquetan solos — cópialos junto al
+  `.exe` en `dist/`, o ajusta las rutas si prefieres que sean fijas.
 
----
+### ¿Y `run.vbs`?
 
-## 🔁 Inicio automático con Windows
+`run.vbs` **no es para uso manual**. La app lo usa internamente solo para
+la opción **"Iniciar con el sistema (minimizado)"**: crea una entrada en
+el Registro de Windows que ejecuta
+`wscript.exe run.vbs --minimized`, que a su vez lanza
+`pythonw spotify_sync_gui.py --minimized` sin ninguna ventana de consola
+(por eso usa `.vbs` y no llama a Python directo). Si no usas esa opción,
+puedes ignorar `run.vbs` por completo.
 
-Al activar la casilla "Iniciar con Windows (minimizado)":
-- Se crea una entrada en `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` que lanza `run.vbs --minimized` en cada arranque de sesión.
-- La app abre directo en la bandeja, sin mostrar ventana.
-- Si el Auto-Sync estaba activo, se reanuda solo.
-- Si más adelante mueves o renombras la carpeta del proyecto, la app **detecta y repara la ruta automáticamente** la próxima vez que la abras manualmente (no necesitas tocar el registro a mano).
+## Estructura del proyecto
 
----
+```
+spotify_sync_gui.py       # App completa: extractor, motor de sync, GUI
+requirements.txt          # Dependencias de Python
+run.bat                   # Lanzador manual para Windows (con consola)
+run.vbs                   # Lanzador silencioso, solo para autoinicio
+spotify_sync_config.json  # Se crea solo: playlists y ajustes guardados
+spotify_sync.log          # Se crea solo: registro completo de la app
+.spotify_sync_state/      # Se crea solo: estado interno por playlist
+```
 
-## 🛠️ Solución de problemas
+## Variables de entorno (opcional)
 
-**"No se pudo agregar la playlist" / error al extraer datos de Spotify**
-- Verifica que la URL sea pública y tenga el formato `https://open.spotify.com/playlist/ID`.
-- Reinstala/actualiza `spotifyscraper`: `pip install -U spotifyscraper` (Spotify cambia su web player de vez en cuando y la librería se actualiza para seguirle el paso).
+La mayoría de los ajustes se controlan desde la interfaz, pero también se
+pueden fijar por variable de entorno (útil para correr sin GUI/en servidor):
 
-**Las descargas fallan o quedan en 0 bytes**
-- Casi siempre es que falta **FFmpeg** en el `PATH`. Verifica con `ffmpeg -version` en una terminal nueva.
-- Actualiza `yt-dlp` (YouTube cambia su sitio seguido y rompe versiones viejas): `pip install -U yt-dlp`.
+| Variable          | Default                | Descripción                                   |
+|-------------------|-------------------------|------------------------------------------------|
+| `OUTPUT_FORMAT`   | `mp3`                  | `mp3`, `m4a`, `flac` u `opus`                  |
+| `SYNC_INTERVAL`   | `30`                   | Segundos entre revisiones del Auto-Sync        |
+| `DELETE_REMOVED`  | `true`                 | Borra localmente lo quitado de la playlist     |
+| `SKIP_EXPLICIT`   | `false`                | Omite canciones marcadas como explícitas       |
+| `MIN_POPULARITY`  | `0`                    | Popularidad mínima (0-100) para descargar      |
+| `BLOCKED_ARTISTS` | *(vacío)*               | Lista de artistas a excluir, separados por coma|
+| `STATE_DIR`       | `.spotify_sync_state`  | Carpeta donde se guarda el estado interno      |
 
-**"Faltan dependencias" al abrir la app**
-- Vuelve a correr `pip install -r requirements.txt`. Si usas varias versiones de Python, confirma que estás instalando en la misma que usas para ejecutar el script (`python -m pip install ...`).
+## Limitaciones y notas
 
-**El icono de la bandeja no aparece / error de pystray**
-- Instala/actualiza: `pip install -U pystray Pillow`.
-- En algunos antivirus muy estrictos, `pystray` puede ser marcado por error; agrega una excepción si es necesario.
+- Requiere que las playlists sean **públicas** (se leen vía scraping, no
+  con la API oficial de Spotify ni credenciales de usuario).
+- La descarga real del audio se hace vía YouTube (con SoundCloud como
+  respaldo si YouTube falla), usando `yt-dlp`. Úsalo bajo tu propia
+  responsabilidad y respetando los términos de servicio de cada plataforma
+  y el derecho de autor del contenido.
+- Este proyecto no está afiliado a Spotify, YouTube ni SoundCloud.
 
-**El inicio automático con Windows dejó de funcionar tras mover la carpeta**
-- Abre la app una vez manualmente (doble clic) — se repara sola la ruta guardada en el registro. Como alternativa, desmarca y vuelve a marcar la casilla "Iniciar con Windows".
+## Licencia
 
-**Windows Defender / SmartScreen marca `run.vbs` o el script**
-- Es un falso positivo común con scripts `.vbs` y ejecutables de Python sin firmar. Agrega una excepción si confías en el origen del archivo.
-
----
-
-## 🔒 Privacidad
-
-Toda la información (playlists agregadas, estado de sincronización, configuración) se guarda **localmente** en tu propia carpeta (`spotify_sync_config.json` y `.spotify_sync_state/`). La app no envía datos a ningún servidor propio; solo se comunica con Spotify (para leer metadatos públicos de la playlist) y YouTube (para buscar y descargar el audio).
+Añade aquí la licencia que prefieras (por ejemplo, MIT) creando un archivo
+`LICENSE` en la raíz del repositorio.

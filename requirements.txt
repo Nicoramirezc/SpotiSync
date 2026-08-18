@@ -1,5 +1,16 @@
-requests>=2.31.0
-spotifyscraper>=2.1.0
-yt-dlp>=2024.1.0
+# --- Obligatorias -----------------------------------------------------
+requests>=2.31
+Pillow>=10.0
+spotifyscraper>=2.0
+yt-dlp>=2024.1.1
+mutagen>=1.47
+
+# --- Opcional: ícono en la bandeja del sistema + minimizar a bandeja ---
+# Si no la instalas, la app funciona igual pero sin ícono de bandeja.
 pystray>=0.19.5
-Pillow>=10.0.0
+
+# --- No es un paquete de pip, léelo aparte ------------------------------
+# ffmpeg debe estar instalado y en el PATH del sistema:
+#   Windows: winget install Gyan.FFmpeg   (o descarga el .exe y ponlo junto al script)
+#   Linux:   sudo apt install ffmpeg      (Debian/Ubuntu/Mint)
+#            sudo pacman -S ffmpeg        (Arch)
