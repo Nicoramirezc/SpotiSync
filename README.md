@@ -154,17 +154,22 @@ pueden fijar por variable de entorno (útil para correr sin GUI/en servidor):
 | `BLOCKED_ARTISTS` | *(vacío)*               | Lista de artistas a excluir, separados por coma|
 | `STATE_DIR`       | `.spotify_sync_state`  | Carpeta donde se guarda el estado interno      |
 
-## Limitaciones y notas
+## ⚠️ Aviso Legal y Descargo de Responsabilidad (Disclaimer)
 
-- Requiere que las playlists sean **públicas** (se leen vía scraping, no
-  con la API oficial de Spotify ni credenciales de usuario).
-- La descarga real del audio se hace vía YouTube (con SoundCloud como
-  respaldo si YouTube falla), usando `yt-dlp`. Úsalo bajo tu propia
-  responsabilidad y respetando los términos de servicio de cada plataforma
-  y el derecho de autor del contenido.
-- Este proyecto no está afiliado a Spotify, YouTube ni SoundCloud.
+Este proyecto ha sido desarrollado con fines puramente **educativos y para uso estrictamente personal**. 
+
+- **No a la piratería:** El autor de este proyecto no apoya, promueve, ni fomenta la piratería, la descarga ilegal de música ni la infracción de derechos de autor de ninguna forma.
+- **Responsabilidad del usuario:** Al utilizar `Spotify Sync`, tú como usuario asumes la responsabilidad total e incondicional de tus acciones. Es tu obligación legal asegurarte de que tienes el derecho, la autorización o el amparo legal (como el derecho a la copia privada, según tu legislación local) para descargar y almacenar este contenido.
+- **Términos de servicio (ToS):** Esta herramienta utiliza técnicas de scraping y herramientas de terceros (`yt-dlp`) para obtener audio de plataformas como YouTube o SoundCloud. El uso de esta herramienta puede violar los Términos de Servicio de Spotify, YouTube, SoundCloud u otras plataformas involucradas. Úsalo bajo tu propio riesgo.
+- **Sin afiliación:** Este proyecto es independiente y no está afiliado, respaldado, ni patrocinado por Spotify AB, Google LLC (YouTube), SoundCloud Ltd., ni ninguna de sus empresas matrices o afiliadas.
+
+## Limitaciones y notas técnicas
+
+- Requiere que las playlists sean **públicas** (se leen vía scraping, no con la API oficial de Spotify ni credenciales de usuario).
+- La descarga real del audio se hace vía YouTube (con SoundCloud como respaldo si YouTube falla), usando `yt-dlp`.
 
 ## Licencia
 
-Añade aquí la licencia que prefieras (por ejemplo, MIT) creando un archivo
-`LICENSE` en la raíz del repositorio.
+El **código fuente** de este proyecto se distribuye bajo la [Licencia MIT](LICENSE). 
+
+El software se proporciona "tal cual" (AS IS), sin garantía de ningún tipo, explícita o implícita. Revisa el archivo `LICENSE` para más detalles.
