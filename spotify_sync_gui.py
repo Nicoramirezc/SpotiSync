@@ -1,22 +1,7 @@
 #!/usr/bin/env python3
-"""
-Spotify Sync GUI - Cross-platform (Windows & Linux)
-- Auto-Sync se activa automáticamente al agregar una playlist
-- Intervalo por defecto: 30s
-- Opción de inicio automático con el sistema (minimizado a la bandeja)
-- UI mejorada: más clara, agrupada y con indicadores de estado
-- Código optimizado: evita errores 403 de YouTube, corrige portadas
-  y metadatos, y mejora el rendimiento general.
-
-Requiere: pip install requests spotifyscraper yt-dlp pystray Pillow mutagen (+ ffmpeg en el PATH)
-
-Linux extra:
-    sudo apt install python3-tk python3-pil.imagetk libappindicator3-1   (Debian/Ubuntu/Mint)
-    sudo pacman -S python tk libappindicator-gtk3                        (Arch)
-"""
-
 import base64
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -32,18 +17,11 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import font as tkfont, messagebox, simpledialog, ttk
 from typing import List, Optional, Dict, Any, Callable, Tuple
-import importlib.util
 
 
 def _fatal_missing_deps(missing: list):
-    """Si falta una dependencia obligatoria (requests/Pillow), un doble clic
-    en el .py normalmente abre con pythonw.exe: sin consola, así que el
-    ModuleNotFoundError no se ve en ningún lado y la ventana simplemente
-    nunca aparece. Esto muestra un diálogo nativo de Tk (que sí es parte de
-    la librería estándar) explicando qué falta y cómo instalarlo, en vez de
-    morir en silencio."""
     try:
         root = tk.Tk()
         root.withdraw()
@@ -51,15 +29,13 @@ def _fatal_missing_deps(missing: list):
             "Spotify Sync — Faltan dependencias",
             "No se pudo iniciar porque falta instalar:\n\n"
             f"  {', '.join(missing)}\n\n"
-            "Abre una terminal en esta carpeta y ejecuta:\n\n"
-            f"    pip install -r requirements.txt\n\n"
-            "(o: pip install " + " ".join(missing) + ")\n\n"
-            "Si ya lo instalaste, revisa que sea el mismo Python con el que "
-            "abres este archivo (puede haber varias instalaciones)."
+            "Ejecuta en una terminal:\n\n"
+            f"    pip install {' '.join(missing)}\n\n"
+            "Si ya lo instalaste, verifica que sea el mismo Python."
         )
         root.destroy()
     except Exception:
-        pass  # Ni siquiera Tk está disponible: no hay forma de avisar en GUI.
+        pass
     sys.exit(1)
 
 
@@ -69,9 +45,6 @@ try:
 except ImportError as _e:
     _fatal_missing_deps(["requests", "Pillow"])
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 LOG_FILE = Path(__file__).resolve().parent / "spotify_sync.log"
 logging.basicConfig(
     filename=str(LOG_FILE),
@@ -81,9 +54,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("spotify_sync")
 
-# ---------------------------------------------------------------------------
-# Configuración global
-# ---------------------------------------------------------------------------
 PYSTRAY_AVAILABLE = (
     importlib.util.find_spec("pystray") is not None
     and importlib.util.find_spec("PIL") is not None
@@ -97,9 +67,15 @@ IS_WINDOWS = os.name == "nt"
 IS_LINUX = sys.platform.startswith("linux")
 
 
-# ---------------------------------------------------------------------------
-# Funciones de inicio automático (Windows / Linux)
-# ---------------------------------------------------------------------------
+def _enable_windows_dark_titlebar_global():
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            ctypes.windll.uxtheme.SetPreferredAppMode(2)
+        except Exception:
+            pass
+
+
 def _run_vbs_path() -> Path:
     return Path(__file__).resolve().parent / "run.vbs"
 
@@ -203,9 +179,6 @@ X-GNOME-Autostart-enabled=true
     return False
 
 
-# ---------------------------------------------------------------------------
-# Clase ToolTip
-# ---------------------------------------------------------------------------
 class ToolTip:
     def __init__(self, widget, text: str):
         self.widget = widget
@@ -237,12 +210,9 @@ class ToolTip:
             self.tip = None
 
 
-# ---------------------------------------------------------------------------
-# Configuración de la aplicación
-# ---------------------------------------------------------------------------
 class Config:
     OUTPUT_FORMAT = os.getenv("OUTPUT_FORMAT", "mp3")
-    AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "0")   # 0 = mejor calidad VBR
+    AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "0")
     THREADS = int(os.getenv("THREADS", "4"))
     SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", "30"))
     DELETE_REMOVED = os.getenv("DELETE_REMOVED", "true").lower() == "true"
@@ -254,9 +224,6 @@ class Config:
     YTDLP_EXTRA = os.getenv("YTDLP_EXTRA", "")
 
 
-# ---------------------------------------------------------------------------
-# Modelos de datos
-# ---------------------------------------------------------------------------
 @dataclass
 class Track:
     id: str
@@ -315,9 +282,6 @@ class Playlist:
     cover_url: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Extractor de Spotify
-# ---------------------------------------------------------------------------
 class SpotifyExtractor:
     def __init__(self):
         self._has_scraper = self._check_scraper()
@@ -470,7 +434,6 @@ class SpotifyExtractor:
                 album = album_data.get('name', '')
             cover_url = self._extract_cover_url(album_data)
             release_date = self._get_attr(album_data, None, 'release_date', '') or ''
-        # Si no hay portada del álbum, intentar con el track
         if not cover_url:
             cover_url = self._extract_cover_url(track_dict) or self._extract_cover_url(track_obj)
         return album, cover_url, release_date
@@ -488,9 +451,6 @@ class SpotifyExtractor:
         raise ValueError(f"URL inválida: {url}")
 
 
-# ---------------------------------------------------------------------------
-# Utilidades de normalización y puntuación
-# ---------------------------------------------------------------------------
 def _normalize_text(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r"[\(\[].*?[\)\]]", " ", s)
@@ -549,9 +509,6 @@ def _score_youtube_candidate(candidate: dict, track: Track) -> float:
     return score
 
 
-# ---------------------------------------------------------------------------
-# Descargador
-# ---------------------------------------------------------------------------
 class Downloader:
     ALWAYS_JUNK_EXTENSIONS = {
         ".jpg", ".jpeg", ".png", ".webp",
@@ -640,8 +597,6 @@ class Downloader:
             return None
 
     def _download_cover(self, url: str) -> Optional[bytes]:
-        """Descarga y procesa la portada: la convierte a JPEG cuadrado de
-        tamaño moderado (500x500) para evitar estiramientos y reducir peso."""
         if not url:
             return None
         if url in self._cover_cache:
@@ -652,7 +607,6 @@ class Downloader:
             if resp.status_code == 200 and resp.content:
                 img = Image.open(BytesIO(resp.content))
                 img = img.convert("RGB")
-                # Redimensionar manteniendo proporción y recortar a cuadrado
                 img.thumbnail((500, 500), Image.Resampling.LANCZOS)
                 width, height = img.size
                 size = min(width, height)
@@ -661,7 +615,6 @@ class Downloader:
                 right = (width + size) / 2
                 bottom = (height + size) / 2
                 img = img.crop((left, top, right, bottom))
-                # Guardar como JPEG en memoria
                 output = BytesIO()
                 img.save(output, format="JPEG", quality=90)
                 data = output.getvalue()
@@ -696,8 +649,6 @@ class Downloader:
     def _apply_id3(self, path: Path, track: Track, artist_str: str, cover_bytes: Optional[bytes]):
         from mutagen.id3 import ID3, TIT2, TPE1, TALB, TPE2, TRCK, TPOS, TDRC, APIC
 
-        # Creamos un objeto ID3 completamente nuevo para sobreescribir
-        # cualquier metadato anterior y evitar conflictos.
         tags = ID3()
         tags["TIT2"] = TIT2(encoding=3, text=track.name)
         tags["TPE1"] = TPE1(encoding=3, text=artist_str)
@@ -793,16 +744,16 @@ class Downloader:
         output_template = str(self.output_dir / f"{filename_base}.%(ext)s")
 
         args = [
-            "-x",                      # Extraer audio
-            "--audio-format", self.config.OUTPUT_FORMAT,   # mp3 por defecto
+            "-x",
+            "--audio-format", self.config.OUTPUT_FORMAT,
             "--audio-quality", self.config.AUDIO_QUALITY,
             "-o", output_template,
-            "--format", "bestaudio/best",   # Solo audio
+            "--format", "bestaudio/best",
             "--no-playlist",
-            "--no-embed-metadata",          # No incrustar metadatos de yt-dlp
-            "--no-embed-thumbnail",         # No incrustar miniatura de yt-dlp
-            "--no-write-thumbnail",         # No descargar miniatura
-            "--no-mtime",                   # No modificar fecha de archivo por yt-dlp
+            "--no-embed-metadata",
+            "--no-embed-thumbnail",
+            "--no-write-thumbnail",
+            "--no-mtime",
         ]
         if is_youtube:
             args += self._cookies_args()
@@ -812,12 +763,8 @@ class Downloader:
             ]
             args += ["--sponsorblock-remove", "all"]
 
-        # Evitar que ffmpeg copie metadatos del contenedor original durante la conversión
         args += [
             "--postprocessor-args", "ffmpeg:-map_metadata -1",
-        ]
-
-        args += [
             "--concurrent-fragments", str(min(self.config.THREADS, 4)),
             "--no-keep-video",
             "--no-continue",
@@ -833,8 +780,6 @@ class Downloader:
         ok, _, stderr = self._run_ytdlp(args, timeout=300)
         final_path = self.output_dir / f"{filename_base}.{self.config.OUTPUT_FORMAT}"
 
-        # Si el archivo de audio existe y tiene tamaño, lo consideramos éxito
-        # aunque yt-dlp haya devuelto un aviso (por ejemplo, 403 al intentar la miniatura)
         if final_path.exists() and final_path.stat().st_size > 0:
             self._apply_metadata(final_path, track)
             if not ok:
@@ -856,7 +801,6 @@ class Downloader:
     def download(self, track: Track) -> Optional[Path]:
         existing = self.find_existing(track)
         if existing and self.config.SKIP_EXISTING:
-            # No aplicamos metadatos aquí para no alterar el orden de la playlist
             return existing
 
         filename_base = self.resolve_filename(track)
@@ -876,12 +820,10 @@ class Downloader:
             if i < len(youtube_queries) - 1:
                 time.sleep(1)
 
-        # Último recurso YouTube
         result = self._attempt(track, f"ytsearch1:{track.search_query}", filename_base, is_youtube=True)
         if result:
             return result
 
-        # Respaldo SoundCloud
         if self._error_cb:
             self._error_cb(f"YouTube no disponible para '{track.display_name}', probando SoundCloud...")
         logger.info("YouTube agotado para '%s', probando SoundCloud como respaldo", track.display_name)
@@ -897,10 +839,6 @@ class Downloader:
         return self._attempt(track, f"scsearch1:{sc_query}", filename_base, is_youtube=False)
 
     def reapply_metadata(self, track: Track) -> Optional[Path]:
-        """
-        Vuelve a incrustar los metadatos y la portada de Spotify en un archivo
-        ya descargado, sin descargar el audio de nuevo.
-        """
         path = self.find_existing(track)
         if path and path.exists():
             self._apply_metadata(path, track)
@@ -921,23 +859,19 @@ class Downloader:
         return disambiguated
 
     def find_existing(self, track: Track) -> Optional[Path]:
-        # Búsqueda flexible: probamos con varios nombres base y extensiones
         names = [track.safe_filename, track.legacy_safe_filename, track.legacy_safe_filename_v0]
         for name in names:
             if not name:
                 continue
-            # Buscar cualquier archivo que comience con el nombre y tenga extensión de audio
             for ext in self.AUDIO_EXTENSIONS:
                 candidate = self.output_dir / f"{name}{ext}"
                 if candidate.exists():
                     logger.info(f"Archivo encontrado: {candidate}")
                     return candidate
-                # También probar con mayúsculas
                 candidate_upper = self.output_dir / f"{name}{ext.upper()}"
                 if candidate_upper.exists():
                     logger.info(f"Archivo encontrado: {candidate_upper}")
                     return candidate_upper
-            # Búsqueda con glob para capturar variaciones
             try:
                 for file in self.output_dir.glob(f"{name}.*"):
                     if file.suffix.lower() in self.AUDIO_EXTENSIONS:
@@ -948,27 +882,7 @@ class Downloader:
         logger.warning(f"No se encontró archivo para '{track.display_name}' (buscado: {names})")
         return None
 
-    def cleanup_track_junk(self, track: Track, filename_base: Optional[str] = None):
-        names = {filename_base, track.safe_filename, track.legacy_safe_filename, track.legacy_safe_filename_v0}
-        prefixes = tuple(f"{n}." for n in names if n)
-        junk_exts = self._junk_extensions()
-        try:
-            for f in self.output_dir.iterdir():
-                if not f.is_file() or not f.name.startswith(prefixes):
-                    continue
-                if f.suffix.lower() in junk_exts:
-                    try:
-                        f.unlink()
-                        logger.info("Limpieza: eliminado archivo huérfano %s", f.name)
-                    except OSError as e:
-                        logger.warning("No se pudo borrar huérfano %s: %s", f.name, e)
-        except Exception as e:
-            logger.warning("Error listando %s para limpieza: %s", self.output_dir, e)
 
-
-# ---------------------------------------------------------------------------
-# Funciones de limpieza y reordenamiento
-# ---------------------------------------------------------------------------
 def cleanup_orphan_files(output_dir: Path, config: Config) -> int:
     final_ext = f".{config.OUTPUT_FORMAT.lower().strip()}"
     junk_exts = Downloader.ALWAYS_JUNK_EXTENSIONS | (Downloader.RAW_CONTAINER_EXTENSIONS - {final_ext})
@@ -977,7 +891,6 @@ def cleanup_orphan_files(output_dir: Path, config: Config) -> int:
         for f in output_dir.iterdir():
             if not f.is_file():
                 continue
-            # Eliminar por extensión basura
             if f.suffix.lower() in junk_exts:
                 try:
                     f.unlink()
@@ -985,7 +898,6 @@ def cleanup_orphan_files(output_dir: Path, config: Config) -> int:
                     continue
                 except OSError as e:
                     logger.warning("No se pudo borrar huérfano %s: %s", f.name, e)
-            # Eliminar temporales con doble extensión (.temp.mp3, .part.mp4, etc.)
             if ".temp." in f.name or ".part." in f.name:
                 try:
                     f.unlink()
@@ -1058,9 +970,6 @@ def reorder_files_by_playlist(tracks: List[Track], files_map: Dict[str, str], ou
     return updated
 
 
-# ---------------------------------------------------------------------------
-# Motor de sincronización
-# ---------------------------------------------------------------------------
 class SyncEngine:
     def __init__(self, config: Config, progress_cb=None, status_cb=None,
                  playlists_source: Optional[Callable[[], List[dict]]] = None,
@@ -1139,7 +1048,6 @@ class SyncEngine:
 
         downloader = Downloader(output_dir, self.config,
                                 error_cb=lambda msg: self.status_cb("", msg) if self.status_cb else None)
-        # Solo detectamos archivos faltantes; no aplicamos metadatos aquí
         for track in tracks:
             if track.id in current_ids and not downloader.find_existing(track):
                 if track.id not in missing_files:
@@ -1153,7 +1061,6 @@ class SyncEngine:
                                f"Faltan: {len(missing_files)} | Orden cambió: {'sí' if order_changed else 'no'}")
 
         if not has_changes:
-            # No hay cambios: no se tocan metadatos ni se reordena
             self._save_state(playlist_id, {
                 "playlist_name": playlist.name,
                 "last_sync": datetime.now().isoformat(),
@@ -1167,7 +1074,6 @@ class SyncEngine:
                     "cover_url": playlist.cover_url}
 
         files_map = {}
-        # Construimos el mapa de archivos existentes sin aplicar metadatos
         for track in tracks:
             existing = downloader.find_existing(track)
             if existing:
@@ -1177,14 +1083,12 @@ class SyncEngine:
             if tid in current_ids and (output_dir / fname).exists():
                 files_map[tid] = fname
 
-        # Refuerzo: revisar de nuevo en disco para no redescargar nada que ya existe
         for track in tracks:
             if track.id not in files_map:
                 existing = downloader.find_existing(track)
                 if existing:
                     files_map[track.id] = str(existing.name)
 
-        # Solo se descargan pistas que no tienen archivo local
         tracks_to_download = [
             t for t in tracks
             if t.id not in files_map or not (output_dir / files_map[t.id]).exists()
@@ -1250,7 +1154,6 @@ class SyncEngine:
                     if rid in files_map:
                         del files_map[rid]
 
-        # Guardar estado y reordenar (el orden se restaura aquí)
         self._save_state(playlist_id, {
             "playlist_name": playlist.name,
             "last_sync": datetime.now().isoformat(),
@@ -1279,11 +1182,6 @@ class SyncEngine:
 
     def fix_metadata_for_playlist(self, playlist_url: str, output_dir: Path,
                                   stop_event: Optional[threading.Event] = None) -> dict:
-        """
-        Corrige los metadatos y portadas de todas las canciones ya descargadas
-        de una playlist. No descarga audio, solo reescribe los tags.
-        Al final reordena las fechas de modificación para mantener el orden de la playlist.
-        """
         playlist_id = self.spotify.extract_playlist_id(playlist_url)
         try:
             playlist = self.spotify.get_playlist(playlist_id)
@@ -1296,7 +1194,7 @@ class SyncEngine:
         updated = 0
         missing = 0
         errors = 0
-        files_map = {}  # Para reordenar después
+        files_map = {}
 
         for i, track in enumerate(tracks):
             if stop_event and stop_event.is_set():
@@ -1316,7 +1214,6 @@ class SyncEngine:
                 errors += 1
                 logger.exception("Error corrigiendo metadatos de %s", track.display_name)
 
-        # Restaurar el orden de la playlist (fechas de modificación)
         reordered = reorder_files_by_playlist(tracks, files_map, output_dir)
 
         result = {
@@ -1330,14 +1227,6 @@ class SyncEngine:
         return result
 
     def get_missing_tracks(self, playlist_url: str, output_dir: Path) -> dict:
-        """
-        Devuelve:
-        - missing: lista de dicts con posición y nombre de pistas faltantes.
-        - collisions: lista de dicts con archivo y pistas (posiciones y nombres) que comparten archivo.
-        - orphans: lista de nombres de archivo en la carpeta que no están en el estado.
-        - total_tracks: número total de pistas en Spotify.
-        - unique_files: número de archivos únicos asignados.
-        """
         playlist_id = self.spotify.extract_playlist_id(playlist_url)
         state = self._load_state(playlist_id)
         files_map = state.get("files", {})
@@ -1350,8 +1239,8 @@ class SyncEngine:
         tracks = [t for t in playlist.tracks if self._filter_track(t)]
 
         missing = []
-        used_names = {}  # filename -> list of (track, position)
-        assigned_files = set()   # archivos referenciados en el estado
+        used_names = {}
+        assigned_files = set()
 
         for idx, track in enumerate(tracks, start=1):
             fname = files_map.get(track.id)
@@ -1365,7 +1254,6 @@ class SyncEngine:
                     assigned_files.add(fname)
                     used_names.setdefault(fname, []).append({"position": idx, "track": track})
 
-        # Detectar colisiones (mismo archivo para varias pistas)
         collisions = []
         for fname, track_list in used_names.items():
             if len(track_list) > 1:
@@ -1379,7 +1267,6 @@ class SyncEngine:
                     "tracks": details
                 })
 
-        # Detectar archivos huérfanos: existen en la carpeta pero no están en files_map
         orphans = []
         if output_dir.exists():
             audio_exts = [
@@ -1454,13 +1341,6 @@ class SyncEngine:
         return self._daemon_running
 
 
-# ---------------------------------------------------------------------------
-# Interfaz gráfica
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Paleta e interfaz gráfica — minimalista, plana, un solo tema (clam) para
-# que los colores se apliquen igual en Windows y Linux y el render sea liviano.
-# ---------------------------------------------------------------------------
 COLOR_BG = "#121212"
 COLOR_SURFACE = "#181818"
 COLOR_SURFACE_ALT = "#282828"
@@ -1476,8 +1356,77 @@ COLOR_WARN = "#F2A93B"
 COLOR_ERROR = "#F15E6C"
 COLOR_INFO = "#509BF5"
 COLOR_IDLE = "#6A6A6A"
+COLOR_TITLEBAR_BG = "#000000"
 
 FONT_FAMILY = "Segoe UI" if IS_WINDOWS else "Noto Sans"
+
+COVER_TEXT_SPACING = 24
+
+
+class RoundedButton(tk.Canvas):
+    def __init__(self, master, text, command=None, bg=COLOR_SURFACE_ALT, fg=COLOR_TEXT,
+                 active_bg=COLOR_SURFACE_HOVER, active_fg=COLOR_TEXT,
+                 radius=18, padx=18, height=36, tooltip=None):
+        super().__init__(master, bg=COLOR_BG, highlightthickness=0, bd=0, height=height)
+        self.command = command
+        self.bg = bg
+        self.fg = fg
+        self.active_bg = active_bg
+        self.active_fg = active_fg
+        self.radius = radius
+        self.padx = padx
+        self.height = height
+        self.text = text
+        self._enabled = True
+        self._active = False
+        self._font = tkfont.Font(font=(FONT_FAMILY, 9, "bold"))
+        self._draw()
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+        if tooltip:
+            ToolTip(self, tooltip)
+
+    def set_text(self, text):
+        self.text = text
+        self._draw()
+
+    def set_style(self, bg, fg, active_bg=None, active_fg=None):
+        self.bg = bg
+        self.fg = fg
+        if active_bg is not None:
+            self.active_bg = active_bg
+        if active_fg is not None:
+            self.active_fg = active_fg
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = max(60, self._font.measure(self.text) + 2 * self.padx)
+        h = self.height
+        self.config(width=w, height=h)
+        r = min(self.radius, h // 2)
+        bg = self.bg if self._enabled else COLOR_SURFACE_ALT
+        fg = self.fg if self._enabled else COLOR_TEXT_FAINT
+        if self._active and self._enabled:
+            bg = self.active_bg
+            fg = self.active_fg
+        self.create_oval(0, 0, 2 * r, h, fill=bg, outline=bg)
+        self.create_oval(w - 2 * r, 0, w, h, fill=bg, outline=bg)
+        self.create_rectangle(r, 0, w - r, h, fill=bg, outline=bg)
+        self.create_text(w // 2, h // 2, text=self.text, fill=fg, font=self._font)
+
+    def _on_enter(self, _event=None):
+        self._active = True
+        self._draw()
+
+    def _on_leave(self, _event=None):
+        self._active = False
+        self._draw()
+
+    def _on_click(self, _event=None):
+        if self._enabled and self.command:
+            self.command()
 
 
 class SpotifySyncApp:
@@ -1486,6 +1435,15 @@ class SpotifySyncApp:
         self.root.title("Spotify Sync")
         self.root.geometry("900x640")
         self.root.minsize(760, 540)
+
+        icon_path = Path(__file__).resolve().parent / "assets" / "icono.png"
+        if icon_path.exists():
+            try:
+                icon_img = ImageTk.PhotoImage(file=str(icon_path))
+                self.root.iconphoto(True, icon_img)
+                self._icon_photo = icon_img
+            except Exception as e:
+                logger.warning("No se pudo cargar el icono de la ventana: %s", e)
 
         self.config = Config()
         self.engine = SyncEngine(self.config, progress_cb=self.on_progress, status_cb=self.on_status)
@@ -1501,9 +1459,9 @@ class SpotifySyncApp:
         self._pending = []
         self._save_config_job = None
         self._queue_poll_job = None
-        self._playlist_totals: Dict[str, int] = {}   # URL → total de pistas en vivo
-        self._thumb_photos: Dict[str, ImageTk.PhotoImage] = {}  # cover_url → imagen viva (evita que el GC la borre)
-        self._thumb_requested: set = set()            # cover_url ya en descarga/descargados esta sesión
+        self._playlist_totals: Dict[str, int] = {}
+        self._thumb_photos: Dict[str, ImageTk.PhotoImage] = {}
+        self._thumb_requested: set = set()
         self._placeholder_thumb: Optional[ImageTk.PhotoImage] = None
 
         self._setup_style()
@@ -1521,11 +1479,7 @@ class SpotifySyncApp:
         if start_minimized:
             self.root.after(700, lambda: self.hide_to_tray(silent=True))
 
-    # -- Estilo -------------------------------------------------------------
     def _setup_style(self):
-        """Un único tema (clam) aplicado igual en todas las plataformas: menos
-        capas nativas que redibujar que un tema del sistema, y control total
-        de color para un look plano y consistente."""
         style = ttk.Style()
         try:
             style.theme_use("clam")
@@ -1545,8 +1499,7 @@ class SpotifySyncApp:
                          font=(FONT_FAMILY, 22, "bold"))
         style.configure("Subtitle.TLabel", background=COLOR_BG, foreground=COLOR_TEXT_MUTED,
                          font=(FONT_FAMILY, 10))
-        # Spotify no encierra secciones en cajas con borde: separa con
-        # espacio y una cabecera en mayúsculas apagada. Sin relief/borde.
+
         style.configure("Section.TLabelframe", background=COLOR_BG, borderwidth=0, relief="flat")
         style.configure("Section.TLabelframe.Label", background=COLOR_BG,
                          foreground=COLOR_TEXT_FAINT, font=(FONT_FAMILY, 8, "bold"))
@@ -1564,7 +1517,6 @@ class SpotifySyncApp:
                          bordercolor=COLOR_SURFACE_ALT)
         style.map("TMenubutton", background=[("active", COLOR_SURFACE_HOVER)])
 
-        # Botón "píldora" verde: el CTA principal, como el de Spotify.
         style.configure("Accent.TButton", background=COLOR_ACCENT, foreground="#000000",
                          borderwidth=0, focusthickness=0, padding=(18, 9), relief="flat",
                          lightcolor=COLOR_ACCENT, darkcolor=COLOR_ACCENT, bordercolor=COLOR_ACCENT,
@@ -1579,7 +1531,6 @@ class SpotifySyncApp:
         style.map("Stop.TButton", background=[("active", COLOR_SURFACE_HOVER)],
                   lightcolor=[("active", COLOR_SURFACE_HOVER)], darkcolor=[("active", COLOR_SURFACE_HOVER)])
 
-        # Filas más altas para que quepa la portada de la playlist.
         style.configure("Treeview", background=COLOR_SURFACE, fieldbackground=COLOR_SURFACE,
                          foreground=COLOR_TEXT, borderwidth=0, rowheight=48, relief="flat",
                          lightcolor=COLOR_SURFACE, darkcolor=COLOR_SURFACE, bordercolor=COLOR_SURFACE,
@@ -1592,9 +1543,6 @@ class SpotifySyncApp:
         style.map("Treeview.Heading", background=[("active", COLOR_BG)])
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
 
-        # El tema "clam" dibuja un bisel 3D (borde claro arriba/izq, oscuro
-        # abajo/der) en estos widgets salvo que se anulen lightcolor/darkcolor
-        # explícitamente. Ese bisel es justo el "borde blanco" en modo oscuro.
         style.configure("Thin.Horizontal.TProgressbar", troughcolor=COLOR_SURFACE_ALT,
                          background=COLOR_ACCENT, borderwidth=0, thickness=4,
                          lightcolor=COLOR_ACCENT, darkcolor=COLOR_ACCENT,
@@ -1631,53 +1579,44 @@ class SpotifySyncApp:
         self.root.option_add("*TCombobox*Listbox.foreground", COLOR_TEXT)
         self.root.option_add("*Dialog.msg.font", (FONT_FAMILY, 9))
 
-        # En Windows, quita el marco/título claro por defecto (era el "borde
-        # blanco" que se veía en modo oscuro) y lo pinta a juego.
-        self.root.after(10, self._apply_windows_dark_titlebar)
+        self.root.after(0, self._apply_windows_dark_titlebar)
 
     def _apply_windows_dark_titlebar(self):
-        """Windows dibuja la barra de título y el borde de la ventana con el
-        tema claro del sistema salvo que se le pida explícitamente lo
-        contrario vía DWM. Esto es lo que causaba los bordes/título blancos
-        alrededor de una app por lo demás oscura. Requiere Windows 10 1809+
-        (modo oscuro) / Windows 11 22H2+ (color de borde y título)."""
         if not IS_WINDOWS:
             return
-        try:
-            import ctypes
 
-            def to_colorref(hex_color: str) -> int:
-                hex_color = hex_color.lstrip('#')
-                r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
-                return r | (g << 8) | (b << 16)
+        def apply():
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+                if not hwnd:
+                    hwnd = ctypes.windll.user32.GetAncestor(self.root.winfo_id(), 2)
 
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            dwmapi = ctypes.windll.dwmapi
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int)
+                )
 
-            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-            DWMWA_BORDER_COLOR = 34
-            DWMWA_CAPTION_COLOR = 35
-            DWMWA_TEXT_COLOR = 36
+                def colorref(hex_color):
+                    hex_color = hex_color.lstrip('#')
+                    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+                    return r | (g << 8) | (b << 16)
 
-            dark = ctypes.c_int(1)
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                                          ctypes.byref(dark), ctypes.sizeof(dark))
+                for attr, color in ((34, COLOR_BORDER), (35, COLOR_TITLEBAR_BG), (36, COLOR_TEXT)):
+                    try:
+                        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                            hwnd, attr, ctypes.byref(ctypes.c_int(colorref(color))),
+                            ctypes.sizeof(ctypes.c_int)
+                        )
+                    except Exception:
+                        pass
 
-            border = ctypes.c_int(to_colorref(COLOR_BORDER))
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR,
-                                          ctypes.byref(border), ctypes.sizeof(border))
+                ctypes.windll.uxtheme.AllowDarkModeForWindow(hwnd, True)
+            except Exception:
+                pass
 
-            caption = ctypes.c_int(to_colorref(COLOR_BG))
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR,
-                                          ctypes.byref(caption), ctypes.sizeof(caption))
-
-            text_color = ctypes.c_int(to_colorref(COLOR_TEXT))
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR,
-                                          ctypes.byref(text_color), ctypes.sizeof(text_color))
-        except Exception:
-            # Versión de Windows sin soporte (pre-1809) u otra falla no
-            # crítica: la app sigue funcionando con la barra de título nativa.
-            logger.debug("No se pudo oscurecer la barra de título de Windows", exc_info=True)
+        self.root.after(50, apply)
+        self.root.after(250, apply)
+        self.root.after(800, apply)
 
     @staticmethod
     def _binary_available(cmd: List[str]) -> bool:
@@ -1735,7 +1674,6 @@ class SpotifySyncApp:
         except Exception as e:
             logger.warning("No se pudo guardar %s: %s", CONFIG_FILE, e)
 
-    # -- Layout ---------------------------------------------------------
     def build_ui(self):
         outer = ttk.Frame(self.root, padding=16)
         outer.grid(row=0, column=0, sticky="nsew")
@@ -1760,8 +1698,23 @@ class SpotifySyncApp:
 
         title_box = ttk.Frame(hdr)
         title_box.grid(row=0, column=0, sticky="w")
-        ttk.Label(title_box, text="Spotify Sync", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(title_box, text="Tus playlists, siempre descargadas y al día",
+
+        logo_path = Path(__file__).resolve().parent / "assets" / "icono.png"
+        if logo_path.exists():
+            try:
+                logo_img = ImageTk.PhotoImage(
+                    Image.open(logo_path).resize((32, 32), Image.Resampling.LANCZOS)
+                )
+                logo_label = tk.Label(title_box, image=logo_img, bg=COLOR_BG, bd=0)
+                logo_label.image = logo_img
+                logo_label.pack(side="left", padx=(0, 10))
+            except Exception as e:
+                logger.warning("No se pudo cargar el logo del encabezado: %s", e)
+
+        text_box = ttk.Frame(title_box)
+        text_box.pack(side="left")
+        ttk.Label(text_box, text="Spotify Sync", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(text_box, text="Tus playlists, siempre descargadas y al día",
                   style="Subtitle.TLabel").pack(anchor="w", pady=(4, 0))
 
         status_box = ttk.Frame(hdr)
@@ -1778,35 +1731,45 @@ class SpotifySyncApp:
 
         primary = ttk.Frame(tb)
         primary.pack(side="left")
-        b_add = ttk.Button(primary, text="＋ Agregar", command=self.add_playlist)
+
+        b_add = RoundedButton(primary, text="+ Agregar", command=self.add_playlist,
+                              bg=COLOR_SURFACE_ALT, fg=COLOR_TEXT)
         b_add.pack(side="left", padx=(0, 6))
         ToolTip(b_add, "Agrega una playlist por URL. El Auto-Sync se activa al instante.")
 
-        b_sync = ttk.Button(primary, text="⟲ Sincronizar", command=self.sync_now)
+        b_sync = RoundedButton(primary, text="Sincronizar", command=self.sync_now,
+                               bg=COLOR_SURFACE_ALT, fg=COLOR_TEXT)
         b_sync.pack(side="left", padx=6)
         ToolTip(b_sync, "Sincroniza la playlist seleccionada (o todas si no hay selección)")
 
-        b_del = ttk.Button(primary, text="Quitar", command=self.remove_playlist)
+        b_del = RoundedButton(primary, text="Quitar", command=self.remove_playlist,
+                              bg=COLOR_SURFACE_ALT, fg=COLOR_TEXT)
         b_del.pack(side="left", padx=6)
         ToolTip(b_del, "Quita la playlist seleccionada de la lista (no borra archivos)")
 
-        tools = ttk.Menubutton(primary, text="Más ⌄")
-        tools_menu = tk.Menu(tools, tearoff=0, bg=COLOR_SURFACE_ALT, fg=COLOR_TEXT,
-                              activebackground=COLOR_ACCENT, activeforeground="#0A0A0A",
-                              bd=0)
-        tools_menu.add_command(label="⬇ Forzar descarga completa", command=self.force_download)
-        tools_menu.add_command(label="🛠 Corregir metadatos", command=self.fix_metadata_now)
-        tools_menu.add_command(label="🔍 Ver faltantes / huérfanos", command=self.show_missing_tracks)
-        tools_menu.add_separator()
-        tools_menu.add_command(label="⟳ Actualizar yt-dlp", command=self.update_ytdlp)
-        tools.configure(menu=tools_menu)
-        tools.pack(side="left", padx=6)
-        ToolTip(tools, "Diagnóstico y mantenimiento: metadatos, archivos faltantes, actualizar yt-dlp")
+        b_more = RoundedButton(primary, text="Más", command=self._show_more_menu,
+                               bg=COLOR_SURFACE_ALT, fg=COLOR_TEXT)
+        b_more.pack(side="left", padx=6)
+        ToolTip(b_more, "Diagnóstico y mantenimiento: metadatos, archivos faltantes, actualizar yt-dlp")
 
-        self.btn_daemon = ttk.Button(tb, text="▶ Iniciar Auto-Sync", style="Accent.TButton",
-                                      command=self.toggle_daemon)
+        self.btn_daemon = RoundedButton(tb, text="Iniciar Auto-Sync", command=self.toggle_daemon,
+                                        bg=COLOR_ACCENT, fg="#000000",
+                                        active_bg=COLOR_ACCENT_HOVER, active_fg="#000000")
         self.btn_daemon.pack(side="right")
         ToolTip(self.btn_daemon, "Activa/desactiva la sincronización automática periódica")
+
+    def _show_more_menu(self):
+        menu = tk.Menu(self.root, tearoff=0, bg=COLOR_SURFACE_ALT, fg=COLOR_TEXT,
+                       activebackground=COLOR_ACCENT, activeforeground="#0A0A0A", bd=0)
+        menu.add_command(label="Forzar descarga completa", command=self.force_download)
+        menu.add_command(label="Corregir metadatos", command=self.fix_metadata_now)
+        menu.add_command(label="Ver faltantes / huérfanos", command=self.show_missing_tracks)
+        menu.add_separator()
+        menu.add_command(label="Actualizar yt-dlp", command=self.update_ytdlp)
+        try:
+            menu.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        finally:
+            menu.grab_release()
 
     def _build_progress(self, parent):
         pf = ttk.Frame(parent)
@@ -1825,13 +1788,15 @@ class SpotifySyncApp:
         lf.rowconfigure(0, weight=1)
         parent.rowconfigure(3, weight=1)
 
-        # "tree headings": la columna #0 (icono + texto) hace de portada+nombre,
-        # igual que una fila de playlist en el propio Spotify.
-        cols = ("tracks", "local", "status", "last")
+        cols = ("name", "tracks", "local", "status", "last")
         self.tree = ttk.Treeview(lf, columns=cols, show="tree headings", selectmode="browse")
-        self.tree.heading("#0", text="Nombre", anchor="w")
-        self.tree.column("#0", width=260, minwidth=180, anchor="w", stretch=True)
+
+        cover_width = 36 + COVER_TEXT_SPACING
+        self.tree.heading("#0", text="")
+        self.tree.column("#0", width=cover_width, minwidth=cover_width, anchor="w", stretch=False)
+
         headings = {
+            "name": ("Nombre", 220, "w"),
             "tracks": ("En Spotify", 90, "center"),
             "local": ("Locales", 90, "center"),
             "status": ("Estado", 140, "center"),
@@ -1839,7 +1804,8 @@ class SpotifySyncApp:
         }
         for key, (text, width, anchor) in headings.items():
             self.tree.heading(key, text=text)
-            self.tree.column(key, width=width, anchor=anchor, stretch=False)
+            self.tree.column(key, width=width, anchor=anchor, stretch=(key == "name"))
+
         self.tree.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
 
         scroll = ttk.Scrollbar(lf, orient="vertical", command=self.tree.yview)
@@ -1923,9 +1889,6 @@ class SpotifySyncApp:
             chk_startup.configure(state="disabled")
 
     def _build_statusbar(self, parent):
-        # Discreto a propósito: es solo el último evento, en una línea, sin
-        # marco ni separador. El detalle completo de cada sincronización
-        # siempre queda en spotify_sync.log — esto es apenas una pista visual.
         self.status_var = tk.StringVar(value="")
         bar = ttk.Frame(parent)
         bar.grid(row=6, column=0, sticky="ew", pady=(2, 0))
@@ -1933,8 +1896,6 @@ class SpotifySyncApp:
                   anchor="w").pack(side="left", fill="x", expand=True)
 
     def _set_status(self, text: str):
-        """Actualiza la pista de estado discreta bajo la lista y deja el
-        registro completo únicamente en el archivo .log (no en la UI)."""
         logger.debug(text)
         clipped = text if len(text) <= 110 else text[:107] + "…"
         self.status_var.set(clipped)
@@ -1953,8 +1914,6 @@ class SpotifySyncApp:
         self._schedule_save_config()
 
     def _schedule_save_config(self, delay_ms: int = 600):
-        """Debounce disk writes: coalesce bursts of changes (e.g. every keystroke
-        in the interval spinbox) into a single save after the user pauses."""
         if self._save_config_job is not None:
             self.root.after_cancel(self._save_config_job)
         self._save_config_job = self.root.after(delay_ms, self._flush_config_save)
@@ -1999,11 +1958,15 @@ class SpotifySyncApp:
         if running:
             self.autosync_dot.configure(fg=COLOR_OK)
             self.autosync_label.configure(text="Auto-Sync activo")
-            self.btn_daemon.configure(text="⏸ Detener Auto-Sync", style="Stop.TButton")
+            self.btn_daemon.set_text("Detener Auto-Sync")
+            self.btn_daemon.set_style(bg=COLOR_SURFACE_ALT, fg=COLOR_WARN,
+                                      active_bg=COLOR_SURFACE_HOVER, active_fg=COLOR_WARN)
         else:
             self.autosync_dot.configure(fg=COLOR_IDLE)
             self.autosync_label.configure(text="Auto-Sync detenido")
-            self.btn_daemon.configure(text="▶ Iniciar Auto-Sync", style="Accent.TButton")
+            self.btn_daemon.set_text("Iniciar Auto-Sync")
+            self.btn_daemon.set_style(bg=COLOR_ACCENT, fg="#000000",
+                                      active_bg=COLOR_ACCENT_HOVER, active_fg="#000000")
 
     def refresh_list(self):
         self._hovered_row = None
@@ -2019,25 +1982,29 @@ class SpotifySyncApp:
                 tag = "row_warn"
             elif "Nuevo" in status:
                 tag = "row_new"
-            self.tree.insert("", "end", iid=str(i), text=pl.get("name", "Sin nombre"),
-                              image=self._thumb_for(pl.get("cover_url", "")),
-                              values=(
-                                  st.get("tracks", "-"),
-                                  st.get("local", "-"),
-                                  status,
-                                  st.get("last", "Nunca")
-                              ), tags=(tag,))
+
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(i),
+                text="",
+                image=self._thumb_for(pl.get("cover_url", "")),
+                values=(
+                    pl.get("name", "Sin nombre"),
+                    st.get("tracks", "-"),
+                    st.get("local", "-"),
+                    status,
+                    st.get("last", "Nunca")
+                ),
+                tags=(tag,)
+            )
             self._request_thumb(str(i), pl.get("cover_url", ""))
 
-    # -- Portadas de playlist -------------------------------------------
     def _placeholder(self) -> ImageTk.PhotoImage:
-        """Ícono neutro mientras se descarga (o si falla) la portada real."""
         if self._placeholder_thumb is None:
             size = 36
             img = Image.new("RGBA", (size, size), COLOR_SURFACE_ALT)
             draw = ImageDraw.Draw(img)
-            # Una nota musical simple dibujada a mano: no depende de fuentes
-            # del sistema, así que se ve igual en Windows y Linux.
             draw.ellipse((9, 21, 17, 29), fill=COLOR_TEXT_FAINT)
             draw.ellipse((21, 17, 29, 25), fill=COLOR_TEXT_FAINT)
             draw.rectangle((16, 9, 18, 25), fill=COLOR_TEXT_FAINT)
@@ -2056,8 +2023,6 @@ class SpotifySyncApp:
         return cache_dir / f"{h}.png"
 
     def _request_thumb(self, row_iid: str, cover_url: str):
-        """Descarga (o lee de caché en disco) la portada de una playlist en
-        segundo plano y actualiza esa fila cuando esté lista, sin bloquear la UI."""
         if not cover_url or cover_url in self._thumb_photos or cover_url in self._thumb_requested:
             return
         self._thumb_requested.add(cover_url)
@@ -2226,7 +2191,6 @@ class SpotifySyncApp:
         threading.Thread(target=run, daemon=True).start()
 
     def fix_metadata_now(self):
-        """Corrige los metadatos de la playlist seleccionada."""
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning("Atención", "Selecciona una playlist.")
@@ -2245,7 +2209,6 @@ class SpotifySyncApp:
                     f"sin archivo: {result.get('missing', 0)} | errores: {result.get('errors', 0)}"
                 ))
                 self._safe(self.refresh_list)
-                # Mostrar resumen en un cuadro de diálogo
                 self._safe(lambda: messagebox.showinfo(
                     "Corrección completada",
                     f"Playlist: {pl.get('name', '')}\n\n"
@@ -2263,7 +2226,6 @@ class SpotifySyncApp:
         threading.Thread(target=run, daemon=True).start()
 
     def show_missing_tracks(self):
-        """Muestra un diagnóstico completo: faltantes, colisiones y huérfanos."""
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning("Atención", "Selecciona una playlist.")
@@ -2340,14 +2302,12 @@ class SpotifySyncApp:
         self._safe(lambda: self.progress_var.set(0))
         self._safe(lambda: self.progress_label.configure(text="Listo"))
 
-        # Actualizar total en caché si hay datos reales
         if "total_tracks" in result and not result.get("error"):
             self._safe(lambda: self._playlist_totals.update({url: result["total_tracks"]}))
 
         self._safe(lambda: self._backfill_cover_url(url, result))
         self._safe(self.refresh_list)
 
-        # Mostrar popup con fallos solo si hay fallos y no es auto-sync
         failed = result.get("failed_tracks", [])
         if failed:
             list_text = "\n".join(f"• {t}" for t in failed)
@@ -2381,9 +2341,6 @@ class SpotifySyncApp:
         self._safe(self.refresh_list)
 
     def _backfill_cover_url(self, url: str, result: dict):
-        """Playlists agregadas antes de esta versión no tienen cover_url
-        guardada. En cuanto una sincronización la trae, se guarda una sola
-        vez para no tener que volver a pedirla."""
         cover_url = result.get("cover_url")
         if not cover_url:
             return
@@ -2432,8 +2389,6 @@ class SpotifySyncApp:
                 func()
             except Exception:
                 pass
-        # Busy: keep the tick fast so status/progress feel instant.
-        # Idle: back off to cut needless wake-ups while nothing changes.
         next_delay = 80 if had_items else 250
         self._queue_poll_job = self.root.after(next_delay, self._process_queue)
 
@@ -2469,18 +2424,34 @@ class SpotifySyncApp:
         self.root.deiconify()
         self.root.lift()
 
-    def _setup_tray(self):
-        if self.tray_icon:
-            return
-        import pystray
+    def _default_tray_icon(self):
         from PIL import Image, ImageDraw
-
         img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         draw.ellipse([4, 4, 60, 60], fill=(29, 185, 84, 255))
         draw.ellipse([18, 38, 28, 48], fill=(255, 255, 255, 255))
         draw.rectangle([26, 18, 29, 42], fill=(255, 255, 255, 255))
         draw.rectangle([29, 18, 42, 21], fill=(255, 255, 255, 255))
+        return img
+
+    def _setup_tray(self):
+        if self.tray_icon:
+            return
+        import pystray
+        from PIL import Image
+
+        icon_path = Path(__file__).resolve().parent / "assets" / "icono.png"
+        if icon_path.exists():
+            try:
+                img = Image.open(icon_path).convert("RGBA")
+                img = img.resize((64, 64), Image.LANCZOS)
+            except Exception as e:
+                logger.warning("Error al cargar icono PNG para bandeja: %s", e)
+                img = self._default_tray_icon()
+        else:
+            logger.warning("No se encontró assets/icono.png, usando icono por defecto")
+            img = self._default_tray_icon()
+
         menu = pystray.Menu(
             pystray.MenuItem("Abrir", lambda: self.root.after(0, self.show_from_tray), default=True),
             pystray.MenuItem("Sincronizar ahora", lambda: self.root.after(0, self.sync_now)),
@@ -2490,6 +2461,7 @@ class SpotifySyncApp:
             ),
             pystray.MenuItem("Salir", lambda: self.root.after(0, self.exit_app))
         )
+
         self.tray_icon = pystray.Icon("spotify_sync", img, "Spotify Sync", menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
@@ -2512,8 +2484,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        # Cualquier otro fallo al arrancar (no solo dependencias faltantes)
-        # queda en el .log Y se muestra en pantalla — nunca en silencio.
         logger.exception("Fallo no controlado al iniciar Spotify Sync")
         try:
             _err_root = tk.Tk()
